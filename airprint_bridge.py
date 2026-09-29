@@ -38,6 +38,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Optional, Tuple
 
+try:                                  # optional scanner (eSCL/AirScan) support
+    import escl_scanner
+except ImportError:                   # pragma: no cover
+    escl_scanner = None
+
 # ---------------------------------------------------------------------------
 # Third-party imports
 # ---------------------------------------------------------------------------
@@ -1134,6 +1139,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
     # Reference to the Zeroconf-registered printer name (set on class).
     printer_name: str = ""
     host_ip: str = "127.0.0.1"
+    escl = None                       # EsclScanner instance when scanning is enabled
 
     # Silence the default stderr logging — we log to file.
     def log_message(self, fmt: str, *args: object) -> None:  # noqa: D401
@@ -1175,6 +1181,10 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
             self.client_address[0],
         )
 
+        if self.path.startswith("/eSCL"):
+            self._handle_escl("POST", raw)
+            return
+
         if len(raw) < 8:
             self._send_ipp_error(0, IPP_STATUS_BAD_REQUEST)
             return
@@ -1214,6 +1224,9 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         logger.info(
             "GET %s  from %s", self.path, self.client_address[0]
         )
+        if self.path.startswith("/eSCL"):
+            self._handle_escl("GET", b"")
+            return
         # Return a simple human-readable status page.
         safe_name = html.escape(self.printer_name)
         body = (
@@ -1228,6 +1241,57 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        logger.info("DELETE %s  from %s", self.path, self.client_address[0])
+        if self.path.startswith("/eSCL"):
+            self._handle_escl("DELETE", b"")
+        else:
+            self._send_plain(404, b"")
+
+    def _send_plain(self, code: int, body: bytes, ctype: str = "text/plain",
+                    headers: Optional[dict] = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _handle_escl(self, method: str, body: bytes) -> None:
+        """eSCL (AirScan) endpoints - see escl_scanner.py."""
+        scanner = self.escl
+        if scanner is None:
+            self._send_plain(404, b"scanning not enabled")
+            return
+        parts = [p for p in self.path.split("?")[0].split("/") if p]   # ['eSCL', ...]
+        try:
+            if method == "GET" and parts[1:] == ["ScannerCapabilities"]:
+                self._send_plain(200, scanner.capabilities_xml(), "text/xml")
+            elif method == "GET" and parts[1:] == ["ScannerStatus"]:
+                self._send_plain(200, scanner.status_xml(), "text/xml")
+            elif method == "POST" and parts[1:] == ["ScanJobs"]:
+                job_id = scanner.create_job(body)
+                host = self.headers.get("Host") or f"{self.host_ip}:{IPP_PORT}"
+                self._send_plain(201, b"", headers={
+                    "Location": f"http://{host}/eSCL/ScanJobs/{job_id}"})
+            elif method == "GET" and len(parts) == 4 and parts[1] == "ScanJobs" and parts[3] == "NextDocument":
+                doc = scanner.next_document(parts[2])
+                if doc is None:
+                    err = scanner.job_error(parts[2])
+                    self._send_plain(503 if err else 404, err.encode("utf-8", "replace"))
+                else:
+                    self._send_plain(200, doc[0], doc[1])
+            elif method == "DELETE" and len(parts) == 3 and parts[1] == "ScanJobs":
+                scanner.delete_job(parts[2])
+                self._send_plain(200, b"")
+            else:
+                self._send_plain(404, b"")
+        except Exception:  # noqa: BLE001
+            logger.exception("eSCL request failed: %s %s", method, self.path)
+            self._send_plain(500, b"")
 
     # ------------------------------------------------------------------ #
     # IPP operation handlers                                              #
@@ -1468,7 +1532,10 @@ class MDNSAdvertiser:
         printer_name: str,
         host_ip: str,
         port: int = IPP_PORT,
+        scanner: bool = False,
     ) -> None:
+        self._scanner = scanner
+        self._scan_info: Optional[ServiceInfo] = None
         self._zc: Optional[Zeroconf] = None
         self._zc_subtype: Optional[Zeroconf] = None
         self._info: Optional[ServiceInfo] = None
@@ -1556,6 +1623,34 @@ class MDNSAdvertiser:
         except Exception:
             logger.exception("Failed to register _universal subtype")
 
+        # --- Scanner service: _uscan._tcp.local. (eSCL / AirScan) ---
+        if self._scanner:
+            scan_txt = {
+                "txtvers": "1",
+                "vers": "2.0",
+                "ty": display_name,
+                "rs": "eSCL",
+                "pdl": "application/pdf,image/jpeg",
+                "cs": "color,grayscale",
+                "is": "platen",
+                "duplex": "F",
+                "adminurl": f"http://{self._host_ip}:{self._port}/",
+                "UUID": printer_uuid_str,
+            }
+            self._scan_info = ServiceInfo(
+                type_="_uscan._tcp.local.",
+                name=f"{clean_instance}._uscan._tcp.local.",
+                addresses=[socket.inet_aton(self._host_ip)],
+                port=self._port,
+                properties=scan_txt,
+                server=f"{safe_host}.local.",
+            )
+            try:
+                self._zc.register_service(self._scan_info, strict=False)
+                logger.info("mDNS scanner service registered: %s", self._scan_info.name)
+            except Exception:
+                logger.exception("Failed to register _uscan service")
+
 
     def unregister(self) -> None:
         """Remove the service from the LAN."""
@@ -1568,6 +1663,12 @@ class MDNSAdvertiser:
                 except Exception:
                     pass
             
+            if self._scan_info is not None and self._zc is not None:
+                try:
+                    self._zc.unregister_service(self._scan_info)
+                except Exception:
+                    pass
+
             if self._info is not None and self._zc is not None:
                 try:
                     self._zc.unregister_service(self._info)
@@ -1614,7 +1715,21 @@ def main(shutdown_event: threading.Event) -> None:
     IPPRequestHandler.host_ip = host_ip
 
     # ---- Start mDNS advertiser ----
-    mdns = MDNSAdvertiser(printer_name, host_ip, IPP_PORT)
+    scanner_enabled = False
+    wia_name = str(_load_config().get("scanner") or "")
+    if wia_name:
+        if escl_scanner is None:
+            logger.error("config.json has 'scanner' but escl_scanner.py is missing - scanning disabled")
+        else:
+            IPPRequestHandler.escl = escl_scanner.EsclScanner(
+                wia_name,
+                get_display_name(printer_name),
+                str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
+            )
+            scanner_enabled = True
+            logger.info("Scanner sharing enabled for WIA device: %s", wia_name)
+
+    mdns = MDNSAdvertiser(printer_name, host_ip, IPP_PORT, scanner=scanner_enabled)
     mdns.register()
 
     # ---- Start HTTP / IPP server ----

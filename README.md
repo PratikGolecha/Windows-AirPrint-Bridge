@@ -131,3 +131,12 @@ python diagnose.py
 1. **mDNS Registration:** Uses a dual-instance `zeroconf` approach to simultaneously register the primary IPP service and the Apple-specific `_universal` subtype pointing to the same instance name in the local domain.
 2. **IPP Binary Protocol:** The server implements a minimal IPP 1.1 / 2.0 binary protocol parser, handling `Print-Job`, `Validate-Job`, and `Get-Printer-Attributes` operations. It responds with mandatory and extended attributes required by modern iOS releases.
 3. **Print Spooling:** When a document is received, it is dumped to a temporary file. `win32ui` and `win32print` are used in combination with `fitz` (PyMuPDF) to draw the document natively into the printer's device context, bypassing the problematic shell-based PDF printing methods.
+
+## Scanning (eSCL / AirScan) — fork addition
+
+Set `"scanner": "<WIA device name>"` in `config.json` (the scanner's name as Windows lists it,
+e.g. `"Canon G4070 series"`).  The bridge then also announces `_uscan._tcp` under the same name
+as the printer and serves eSCL on the same port (`/eSCL/ScannerCapabilities`, `/ScanJobs`, …),
+so phones/Macs/PCs see one printer+scanner.  Flat-bed only; JPEG or PDF; colour/grey; 75–600 dpi.
+The scanner is driven through Windows Image Acquisition (WIA), so the scanner's Windows driver
+must be installed, and — like printing — the bridge must run in the signed-in user's session.
