@@ -42,6 +42,10 @@ try:                                  # optional scanner (eSCL/AirScan) support
     import escl_scanner
 except ImportError:                   # pragma: no cover
     escl_scanner = None
+try:
+    import wsd_device
+except ImportError:      # optional
+    wsd_device = None
 
 # ---------------------------------------------------------------------------
 # Third-party imports
@@ -180,6 +184,8 @@ def detect_file_type(data: bytes) -> Tuple[str, str]:
     """
     if data[:4] == MAGIC_PDF:
         return ".pdf", "application/pdf"
+    if data[:4] == b"RaS2":
+        return ".pwg", "image/pwg-raster"
     if data[:7] == MAGIC_URF:
         return ".urf", "image/urf"
     if data[:3] == MAGIC_JPEG:
@@ -1180,6 +1186,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
     printer_name: str = ""
     host_ip: str = "127.0.0.1"
     escl = None                       # EsclScanner instance when scanning is enabled
+    wsd = None                        # WsdDevice when "wsd": true
 
     # Silence the default stderr logging — we log to file.
     def log_message(self, fmt: str, *args: object) -> None:  # noqa: D401
@@ -1223,6 +1230,10 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/eSCL"):
             self._handle_escl("POST", raw)
+            return
+        if self.path.startswith("/WebServices/") and self.wsd is not None:
+            code, ctype, out, hdrs = self.wsd.handle(self.path, raw, self.headers.get("Content-Type", ""))
+            self._send_plain(code, out, ctype, hdrs)
             return
 
         if len(raw) < 8:
@@ -1534,6 +1545,33 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
 # Threaded HTTP server wrapper
 # ---------------------------------------------------------------------------
 
+def print_document_bytes(printer_name: str, doc_data: bytes, fmt: str = "") -> None:
+    """Print a document received over WSD (same pipeline as an IPP Print-Job)."""
+    ext, mime = detect_file_type(doc_data)
+    logger.info("WSD document: %d bytes, declared=%r detected=%s (%s) head=%r", len(doc_data), fmt, ext, mime, doc_data[:24])
+    fd = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="airprint_wsd_")
+    path = fd.name
+    fd.write(doc_data)
+    fd.close()
+    spool = path
+    try:
+        if ext == ".urf":
+            spool = convert_urf_to_pdf(path)
+        elif ext == ".pwg":
+            spool = wsd_device.pwg_raster_to_pdf(doc_data, path + ".pdf")
+        media = None                       # PWG/PDF carry their own page size; only guess for size-less data
+        spool_to_printer(spool, printer_name, media_size_mm=media)
+    except Exception:  # noqa: BLE001
+        logger.exception("WSD print failed")
+    finally:
+        for q in (path, spool):
+            if q and os.path.exists(q):
+                try:
+                    os.remove(q)
+                except OSError:
+                    pass
+
+
 class ThreadedIPPServer(HTTPServer):
     """HTTPServer that handles each request in a new daemon thread."""
 
@@ -1778,6 +1816,25 @@ def main(shutdown_event: threading.Event) -> None:
     mdns = MDNSAdvertiser(printer_name, host_ip, IPP_PORT, scanner=scanner_enabled)
     mdns.register()
 
+    wsd_disc = None
+    if _load_config().get("wsd") and wsd_device is not None:
+        display = get_display_name(printer_name)
+        model = str(_load_config().get("wsd_model") or display)
+        maker = str(_load_config().get("wsd_maker") or model.split()[0])
+        wsd_port = int(_load_config().get("wsd_port") or IPP_PORT)
+        dev = wsd_device.WsdDevice(
+            str(_load_config().get("wsd_uuid") or uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
+            host_ip, wsd_port, display, maker, model,
+            scanner=IPPRequestHandler.escl,
+            print_document=lambda data, fmt: print_document_bytes(printer_name, data, fmt))
+        IPPRequestHandler.wsd = dev
+        try:
+            wsd_disc = wsd_device.WsDiscovery(dev)
+            wsd_disc.start()
+        except Exception:  # noqa: BLE001
+            logger.exception("WSD discovery could not start - WSD disabled")
+            IPPRequestHandler.wsd = None
+
     # ---- Start HTTP / IPP server ----
     server = ThreadedIPPServer(("0.0.0.0", IPP_PORT), IPPRequestHandler)
     logger.info("IPP server listening on 0.0.0.0:%d", IPP_PORT)
@@ -1785,9 +1842,19 @@ def main(shutdown_event: threading.Event) -> None:
     def _cleanup() -> None:
         """atexit hook — ensures mDNS is always unregistered."""
         mdns.unregister()
+        if wsd_disc is not None:
+            wsd_disc.stop()
         logger.info("AirPrint Bridge shut down cleanly.")
 
     atexit.register(_cleanup)
+
+    if IPPRequestHandler.wsd is not None and IPPRequestHandler.wsd.port != IPP_PORT:
+        try:
+            wsd_server = ThreadedIPPServer(("0.0.0.0", IPPRequestHandler.wsd.port), IPPRequestHandler)
+            threading.Thread(target=wsd_server.serve_forever, daemon=True).start()
+            logger.info("WSD HTTP endpoint also listening on 0.0.0.0:%d", IPPRequestHandler.wsd.port)
+        except OSError:
+            logger.exception("could not listen on WSD port %d", IPPRequestHandler.wsd.port)
 
     # Run the server in a background thread so we can wait on the event.
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)

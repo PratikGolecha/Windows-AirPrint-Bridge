@@ -145,7 +145,9 @@ class EsclScanner:
     # Jobs                                                                #
     # ------------------------------------------------------------------ #
     def create_job(self, settings_xml: bytes) -> str:
-        settings = parse_scan_settings(settings_xml)
+        return self.create_job_settings(parse_scan_settings(settings_xml))
+
+    def create_job_settings(self, settings: Dict[str, object]) -> str:
         job_id = str(uuid.uuid4())
         job = {"settings": settings, "state": "pending", "data": None,
                "mime": settings["format"], "error": "", "delivered": False,

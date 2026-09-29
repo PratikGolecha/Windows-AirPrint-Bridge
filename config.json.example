@@ -2,5 +2,9 @@
     "printer": "Canon G4070 series",
     "display_name": "Canon Printer - Workstation 3",
     "default_paper": "A4",
-    "scanner": "Canon G4070 series"
+    "scanner": "Canon G4070 series",
+    "wsd": true,
+    "wsd_port": 80,
+    "wsd_maker": "Canon",
+    "wsd_model": "Canon G4070 series - Shared"
 }
