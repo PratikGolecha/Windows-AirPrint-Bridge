@@ -1,0 +1,10 @@
+{
+    "wsd": true,
+    "wsd_port": 80,
+    "printers": [
+        { "printer": "Canon Printer - Workstation 3", "scanner": "Canon G4070 series", "default_paper": "A4",
+          "wsd_maker": "Canon", "wsd_model": "Canon Printer - Workstation 3", "wsd_uuid": "<pick once, never change>" },
+        { "printer": "Second Printer - Workstation 4", "default_paper": "A4",
+          "wsd_maker": "Canon", "wsd_model": "Second Printer - Workstation 4", "wsd_uuid": "<pick once, never change>" }
+    ]
+}

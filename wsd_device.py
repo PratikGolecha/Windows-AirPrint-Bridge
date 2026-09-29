@@ -100,13 +100,14 @@ class WsdDevice:
     ``print_document`` a callable(bytes, fmt) that prints a received document (or None)."""
 
     def __init__(self, uuid_str: str, host_ip: str, port: int, display_name: str, maker: str, model: str,
-                 scanner=None, print_document: Optional[Callable[[bytes, str], None]] = None) -> None:
+                 scanner=None, print_document: Optional[Callable[[bytes, str], None]] = None,
+                 path_prefix: str = "") -> None:
         self.uuid = uuid_str.lower()
         self.host_ip, self.port = host_ip, port
         self.display_name, self.maker, self.model = display_name, maker, model
         self.scanner = scanner
         self.print_document = print_document
-        self.base = f"http://{host_ip}:{port}/WebServices"
+        self.base = f"http://{host_ip}:{port}{path_prefix}/WebServices"
         self.epr = f"urn:uuid:{self.uuid}"
         self.model_short = model[len(maker):].strip() if model.lower().startswith(maker.lower()) else model
         self.metadata_version = int(time.time()) & 0xFFFFFF
@@ -486,10 +487,11 @@ class WsdDevice:
 
 # ============================================================================ discovery ==
 class WsDiscovery:
-    """WS-Discovery target service: multicast Hello on start, answer Probe/Resolve, Bye on stop."""
+    """WS-Discovery target service for one or more WsdDevice objects sharing one UDP socket:
+    multicast Hello on start, answer Probe/Resolve, Bye on stop."""
 
-    def __init__(self, dev: WsdDevice) -> None:
-        self.dev = dev
+    def __init__(self, devs) -> None:
+        self.devs = list(devs) if isinstance(devs, (list, tuple)) else [devs]
         self.sock: Optional[socket.socket] = None
         self.instance = int(time.time())
         self.msgno = 0
@@ -497,27 +499,30 @@ class WsDiscovery:
         self._lock = threading.Lock()
 
     def start(self) -> None:
+        host_ip = self.devs[0].host_ip
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("", WSD_PORT))
-        mreq = struct.pack("4s4s", socket.inet_aton(MCAST), socket.inet_aton(self.dev.host_ip))
+        mreq = struct.pack("4s4s", socket.inet_aton(MCAST), socket.inet_aton(host_ip))
         s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.dev.host_ip))
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(host_ip))
         s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
         s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
         s.settimeout(1.0)
         self.sock = s
         threading.Thread(target=self._loop, daemon=True, name="wsd-discovery").start()
-        self._hello()
-        logger.info("WSD discovery listening on UDP %d as %s -> %s/Device", WSD_PORT, self.dev.epr, self.dev.base)
+        for d in self.devs:
+            self._hello(d)
+            logger.info("WSD discovery on UDP %d: %s -> %s/Device", WSD_PORT, d.epr, d.base)
 
     def stop(self) -> None:
         self._stop.set()
-        try:
-            self._send_multicast(NS_WSD + "/Bye", "<wsd:Bye><wsa:EndpointReference><wsa:Address>"
-                                 f"{self.dev.epr}</wsa:Address></wsa:EndpointReference></wsd:Bye>", "urn:schemas-xmlsoap-org:ws:2005:04:discovery")
-        except Exception:  # noqa: BLE001
-            pass
+        for d in self.devs:
+            try:
+                self._send_multicast(NS_WSD + "/Bye", "<wsd:Bye><wsa:EndpointReference><wsa:Address>"
+                                     f"{d.epr}</wsa:Address></wsa:EndpointReference></wsd:Bye>", "urn:schemas-xmlsoap-org:ws:2005:04:discovery")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _env(self, action: str, to: str, relates: str, body: str) -> bytes:
         with self._lock:
@@ -533,8 +538,8 @@ class WsDiscovery:
             f"<SOAP-ENV:Body>{body}</SOAP-ENV:Body></SOAP-ENV:Envelope>"
         ).encode("utf-8")
 
-    def _match_body(self, tag: str) -> str:
-        d = self.dev
+    @staticmethod
+    def _match_body(d) -> str:
         return (f"<wsa:EndpointReference><wsa:Address>{d.epr}</wsa:Address></wsa:EndpointReference>"
                 f"<wsd:Types>{d.types}</wsd:Types><wsd:XAddrs>{d.base}/Device</wsd:XAddrs>"
                 f"<wsd:MetadataVersion>{d.metadata_version}</wsd:MetadataVersion>")
@@ -546,8 +551,8 @@ class WsDiscovery:
             self.sock.sendto(msg, (MCAST, WSD_PORT))
             time.sleep(0.2)
 
-    def _hello(self) -> None:
-        self._send_multicast(NS_WSD + "/Hello", f"<wsd:Hello>{self._match_body('Hello')}</wsd:Hello>",
+    def _hello(self, d) -> None:
+        self._send_multicast(NS_WSD + "/Hello", f"<wsd:Hello>{self._match_body(d)}</wsd:Hello>",
                              "urn:schemas-xmlsoap-org:ws:2005:04:discovery")
 
     def _loop(self) -> None:
@@ -567,17 +572,20 @@ class WsDiscovery:
             try:
                 if name == "Probe":
                     want = find_text(body, "Types", "")
-                    if not want or any(t.split(":")[-1] in self.dev.types for t in want.split()):
-                        logger.info("WSD Probe from %s (types=%r) -> ProbeMatch", addr[0], want)
-                        self.sock.sendto(self._env(NS_WSD + "/ProbeMatches", ANON, mid,
-                                                   f"<wsd:ProbeMatches><wsd:ProbeMatch>{self._match_body('')}</wsd:ProbeMatch></wsd:ProbeMatches>"),
-                                         addr)
+                    for d in self.devs:
+                        if not want or any(t.split(":")[-1] in d.types for t in want.split()):
+                            logger.info("WSD Probe from %s (types=%r) -> ProbeMatch %s", addr[0], want, d.display_name)
+                            self.sock.sendto(self._env(NS_WSD + "/ProbeMatches", ANON, mid,
+                                                       f"<wsd:ProbeMatches><wsd:ProbeMatch>{self._match_body(d)}</wsd:ProbeMatch></wsd:ProbeMatches>"),
+                                             addr)
                 elif name == "Resolve":
-                    if self.dev.uuid in data.decode("utf-8", "replace").lower():
-                        logger.info("WSD Resolve from %s -> ResolveMatch", addr[0])
-                        self.sock.sendto(self._env(NS_WSD + "/ResolveMatches", ANON, mid,
-                                                   f"<wsd:ResolveMatches><wsd:ResolveMatch>{self._match_body('')}</wsd:ResolveMatch></wsd:ResolveMatches>"),
-                                         addr)
+                    text = data.decode("utf-8", "replace").lower()
+                    for d in self.devs:
+                        if d.uuid in text:
+                            logger.info("WSD Resolve from %s -> ResolveMatch %s", addr[0], d.display_name)
+                            self.sock.sendto(self._env(NS_WSD + "/ResolveMatches", ANON, mid,
+                                                       f"<wsd:ResolveMatches><wsd:ResolveMatch>{self._match_body(d)}</wsd:ResolveMatch></wsd:ResolveMatches>"),
+                                             addr)
             except Exception:  # noqa: BLE001
                 logger.exception("WSD discovery reply failed")
 

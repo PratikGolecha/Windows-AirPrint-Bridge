@@ -354,14 +354,14 @@ def _load_config() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def get_display_name(printer_name: str) -> str:
+def get_display_name(printer_name: str, cfg: Optional[dict] = None) -> str:
     """
     Name shown to phones and tablets.
 
     Defaults to the plain Windows printer name (no PC-name suffix).  Set
     ``"display_name"`` in config.json to show something different.
     """
-    return str(_load_config().get("display_name") or printer_name)
+    return str((cfg if cfg is not None else _load_config()).get("display_name") or printer_name)
 
 
 _MEDIA_ALIASES = {
@@ -370,7 +370,7 @@ _MEDIA_ALIASES = {
 }
 
 
-def get_default_paper() -> Optional[Tuple[str, Tuple[float, float]]]:
+def get_default_paper(cfg: Optional[dict] = None) -> Optional[Tuple[str, Tuple[float, float]]]:
     """
     ``"default_paper": "A4"`` in config.json = the paper to use when the SENDER DOES NOT CHOOSE a size.
     A job that names a size (Letter, 4x6, A5 ...) is always respected.  Without this setting a job with no
@@ -378,7 +378,7 @@ def get_default_paper() -> Optional[Tuple[str, Tuple[float, float]]]:
     Letter paper.  Leave it unset on label printers (where copying the document size is what you want).
     Accepts A4/A5/A6/Letter/Legal or a full IPP media keyword.  Returns (ipp_keyword, (w_mm, h_mm)) or None.
     """
-    value = str(_load_config().get("default_paper") or "").strip()
+    value = str((cfg if cfg is not None else _load_config()).get("default_paper") or "").strip()
     if not value:
         return None
     key = _MEDIA_ALIASES.get(value.lower(), value)
@@ -390,15 +390,59 @@ def get_default_paper() -> Optional[Tuple[str, Tuple[float, float]]]:
 
 
 def choose_media_size(
-    requested_mm: Optional[Tuple[float, float]], sender_chose: bool,
+    requested_mm: Optional[Tuple[float, float]], sender_chose: bool, cfg: Optional[dict] = None,
 ) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
     """Return (size_to_use, note).  The configured default applies ONLY when the sender named no size."""
     if requested_mm is not None or sender_chose:
         return requested_mm, None
-    default = get_default_paper()
+    default = get_default_paper(cfg)
     if default:
         return default[1], default[0]
     return None, None
+
+
+def _slug(text: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "printer"
+
+
+def get_printer_configs() -> list:
+    """
+    The printers to share.  ``config.json`` either has the usual single-printer keys at the top level
+    (one printer - the original behaviour) or a ``"printers": [ {...}, {...} ]`` list, each entry with its own
+    ``printer``, ``display_name``, ``scanner``, ``default_paper``, ``wsd_model``, ``wsd_maker``, ``wsd_uuid``.
+    Top-level ``wsd`` / ``wsd_port`` apply to all.  The FIRST printer also answers the old un-prefixed URLs
+    (/ipp/print, /eSCL, /WebServices) so existing queues keep working; every printer answers /<id>/...
+    """
+    base = _load_config()
+    entries = base.get("printers")
+    multi = isinstance(entries, list) and bool(entries)
+    if not multi:
+        entries = [{}]
+    out, seen = [], set()
+    for e in entries:
+        if multi:      # a printers[] list: only the shared keys carry over (never one printer's scanner/uuid to another)
+            cfg = {k: base[k] for k in ("wsd", "wsd_port") if k in base}
+        else:
+            cfg = {k: v for k, v in base.items() if k != "printers"}
+        cfg.update(e if isinstance(e, dict) else {})
+        name = str(cfg.get("printer") or "")
+        if not name:
+            name = get_default_printer() if not out else ""
+        if not name:
+            logger.critical("A printers[] entry has no 'printer' name - skipped")
+            continue
+        flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+        if name not in [p[2] for p in win32print.EnumPrinters(flags)]:
+            logger.critical("Configured printer %r not found - skipped", name)
+            continue
+        pid = _slug(str(cfg.get("id") or cfg.get("display_name") or name))
+        while pid in seen or pid in ("ipp", "escl", "webservices"):
+            pid += "-2"
+        seen.add(pid)
+        cfg["printer"], cfg["id"] = name, pid
+        out.append(cfg)
+    return out
 
 
 def get_target_printer() -> str:
@@ -994,14 +1038,16 @@ def extract_ipp_job_attributes(raw: bytes) -> dict[str, str]:
 def _build_printer_attributes(
     printer_name: str,
     host_ip: str,
+    cfg: Optional[dict] = None,
+    url_prefix: str = "",
 ) -> bytes:
     """
     Return the pre-encoded *printer-attributes* group that iOS / Android
     require in order to accept the printer as AirPrint-compatible.
     """
     hostname = socket.gethostname()
-    display_name = get_display_name(printer_name)
-    printer_uri = f"ipp://{host_ip}:{IPP_PORT}/ipp/print"
+    display_name = get_display_name(printer_name, cfg)
+    printer_uri = f"ipp://{host_ip}:{IPP_PORT}{url_prefix}/ipp/print"
     attrs = struct.pack("!B", IPP_TAG_PRINTER)
 
     # --- Identity ---
@@ -1083,7 +1129,7 @@ def _build_printer_attributes(
             win32print.ClosePrinter(hprinter)
     except Exception:
         pass
-    configured_default = get_default_paper()
+    configured_default = get_default_paper(cfg)
     if configured_default:
         default_media = configured_default[0]                  # phones/PCs then offer it first
     logger.info("Active printer default media detected: %s", default_media)
@@ -1201,17 +1247,47 @@ def _build_printer_attributes(
 # IPP-aware HTTP request handler
 # ---------------------------------------------------------------------------
 
+class PrinterCtx:
+    """Everything that belongs to ONE shared printer (its Windows queue, config, scanner and WSD device)."""
+
+    def __init__(self, pid: str, printer_name: str, cfg: dict) -> None:
+        self.id, self.printer_name, self.cfg = pid, printer_name, cfg
+        self.escl = None
+        self.wsd = None
+
+
 class IPPRequestHandler(BaseHTTPRequestHandler):
     """
     Minimal HTTP handler that speaks enough IPP to satisfy AirPrint and
     Android's built-in IPP client.
     """
 
-    # Reference to the Zeroconf-registered printer name (set on class).
-    printer_name: str = ""
     host_ip: str = "127.0.0.1"
-    escl = None                       # EsclScanner instance when scanning is enabled
-    wsd = None                        # WsdDevice when "wsd": true
+    contexts: dict = {}               # printer id -> PrinterCtx
+    default_ctx = None                # the first printer: also answers the old un-prefixed URLs
+    ctx = None
+    url_prefix = ""
+
+    @property
+    def printer_name(self) -> str:
+        return self.ctx.printer_name
+
+    @property
+    def escl(self):
+        return self.ctx.escl
+
+    @property
+    def wsd(self):
+        return self.ctx.wsd
+
+    def _route(self) -> None:
+        """Pick the printer from a /<id>/... URL prefix (stripped from self.path); no prefix = first printer."""
+        self.ctx, self.url_prefix = self.default_ctx, ""
+        for pid, c in self.contexts.items():
+            if self.path == f"/{pid}" or self.path.startswith(f"/{pid}/"):
+                self.ctx, self.url_prefix = c, f"/{pid}"
+                self.path = self.path[len(self.url_prefix):] or "/"
+                break
 
     # Silence the default stderr logging — we log to file.
     def log_message(self, fmt: str, *args: object) -> None:  # noqa: D401
@@ -1224,6 +1300,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
     # POST — the only verb iOS / Android use for IPP                      #
     # ------------------------------------------------------------------ #
     def do_POST(self) -> None:  # noqa: N802
+        self._route()
         logger.info("Headers received from %s:\n%s", self.client_address[0], self.headers)
         
         # Handle chunked transfer encoding (common in iOS AirPrint for large jobs)
@@ -1297,6 +1374,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
     # GET — some clients probe the root or /ipp/print via GET             #
     # ------------------------------------------------------------------ #
     def do_GET(self) -> None:  # noqa: N802
+        self._route()
         logger.info(
             "GET %s  from %s", self.path, self.client_address[0]
         )
@@ -1309,7 +1387,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
             "<html><body>"
             "<h1>AirPrint Bridge</h1>"
             f"<p>Printer: <strong>{safe_name}</strong></p>"
-            "<p>IPP endpoint: <code>POST /ipp/print</code></p>"
+            f"<p>IPP endpoint: <code>POST {self.url_prefix}/ipp/print</code></p>"
             "</body></html>"
         ).encode("utf-8")
         self.send_response(200)
@@ -1319,6 +1397,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_DELETE(self) -> None:  # noqa: N802
+        self._route()
         logger.info("DELETE %s  from %s", self.path, self.client_address[0])
         if self.path.startswith("/eSCL"):
             self._handle_escl("DELETE", b"")
@@ -1352,7 +1431,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 job_id = scanner.create_job(body)
                 host = self.headers.get("Host") or f"{self.host_ip}:{IPP_PORT}"
                 self._send_plain(201, b"", headers={
-                    "Location": f"http://{host}/eSCL/ScanJobs/{job_id}"})
+                    "Location": f"http://{host}{self.url_prefix}/eSCL/ScanJobs/{job_id}"})
             elif method == "GET" and len(parts) == 4 and parts[1] == "ScanJobs" and parts[3] == "NextDocument":
                 doc = scanner.next_document(parts[2])
                 if doc is None:
@@ -1407,7 +1486,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 pass
 
         sender_chose = bool(media_keyword) or ("x-dimension" in job_attrs_parsed and "y-dimension" in job_attrs_parsed)
-        media_size_mm, default_used = choose_media_size(media_size_mm, sender_chose)
+        media_size_mm, default_used = choose_media_size(media_size_mm, sender_chose, self.ctx.cfg)
         if default_used:
             logger.info("Sender did not choose a paper size - using default_paper=%s (%.0f x %.0f mm)",
                         default_used, media_size_mm[0], media_size_mm[1])
@@ -1471,7 +1550,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         job_attrs += _encode_text_attribute(
             IPP_TAG_URI,
             "job-uri",
-            f"ipp://{self.host_ip}:{IPP_PORT}/ipp/print/job/{req_id}",
+            f"ipp://{self.host_ip}:{IPP_PORT}{self.url_prefix}/ipp/print/job/{req_id}",
         )
         job_attrs += _encode_enum_attribute("job-state", 9)  # 9 = completed
 
@@ -1497,7 +1576,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         self, req_id: int, ver_maj: int, ver_min: int,
     ) -> None:
         """Return a rich set of printer attributes for discovery."""
-        attrs = _build_printer_attributes(self.printer_name, self.host_ip)
+        attrs = _build_printer_attributes(self.printer_name, self.host_ip, self.ctx.cfg, self.url_prefix)
         response = build_ipp_response(
             req_id, IPP_STATUS_OK, extra_groups=attrs,
             version_major=ver_maj, version_minor=ver_min,
@@ -1642,7 +1721,11 @@ class MDNSAdvertiser:
         host_ip: str,
         port: int = IPP_PORT,
         scanner: bool = False,
+        cfg: Optional[dict] = None,
+        path_prefix: str = "",
     ) -> None:
+        self._cfg = cfg
+        self._prefix = path_prefix.strip("/") + "/" if path_prefix.strip("/") else ""
         self._scanner = scanner
         self._scan_info: Optional[ServiceInfo] = None
         self._zc: Optional[Zeroconf] = None
@@ -1656,7 +1739,7 @@ class MDNSAdvertiser:
     def register(self) -> None:
         """Broadcast the service on the LAN."""
         hostname = socket.gethostname()
-        display_name = get_display_name(self._printer_name)
+        display_name = get_display_name(self._printer_name, self._cfg)
 
         # Clean display name for mDNS instance label (allow spaces, escape dot/slashes, limit length)
         clean_instance = (
@@ -1680,7 +1763,7 @@ class MDNSAdvertiser:
         txt_props = {
             "txtvers": "1",
             "qtotal": "1",
-            "rp": "ipp/print",
+            "rp": f"{self._prefix}ipp/print",
             "ty": display_name,
             "product": f"({self._printer_name})",
             "pdl": "application/pdf,image/urf,image/jpeg,image/png,image/pwg-raster",
@@ -1738,7 +1821,7 @@ class MDNSAdvertiser:
                 "txtvers": "1",
                 "vers": "2.0",
                 "ty": display_name,
-                "rs": "eSCL",
+                "rs": f"{self._prefix}eSCL",
                 "pdl": "application/pdf,image/jpeg",
                 "cs": "color,grayscale",
                 "is": "platen",
@@ -1814,51 +1897,63 @@ def main(shutdown_event: threading.Event) -> None:
 
     # ---- Detect environment ----
     host_ip = get_local_ip()
-    printer_name = get_target_printer()
-    if not printer_name:
+    cfgs = get_printer_configs()
+    if not cfgs:
         logger.critical("No usable printer (config.json or Windows default) — aborting.")
         sys.exit(1)
-
-    # ---- Configure the request handler class ----
-    IPPRequestHandler.printer_name = printer_name
     IPPRequestHandler.host_ip = host_ip
 
-    # ---- Start mDNS advertiser ----
-    scanner_enabled = False
-    wia_name = str(_load_config().get("scanner") or "")
-    if wia_name:
-        if escl_scanner is None:
-            logger.error("config.json has 'scanner' but escl_scanner.py is missing - scanning disabled")
-        else:
-            IPPRequestHandler.escl = escl_scanner.EsclScanner(
-                wia_name,
-                get_display_name(printer_name),
-                str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
-            )
-            scanner_enabled = True
-            logger.info("Scanner sharing enabled for WIA device: %s", wia_name)
+    contexts: dict = {}
+    mdns_list = []
+    wsd_devs = []
+    for n, cfg in enumerate(cfgs):
+        printer_name = cfg["printer"]
+        ctx = PrinterCtx(cfg["id"], printer_name, cfg)
+        contexts[ctx.id] = ctx
+        first = (n == 0)
+        prefix = "" if first else "/" + ctx.id           # the first printer keeps the old URLs in its announcements
+        logger.info("Printer %d: %s  (id=%s)", n + 1, printer_name, ctx.id)
 
-    mdns = MDNSAdvertiser(printer_name, host_ip, IPP_PORT, scanner=scanner_enabled)
-    mdns.register()
+        wia_name = str(cfg.get("scanner") or "")
+        if wia_name:
+            if escl_scanner is None:
+                logger.error("'scanner' set but escl_scanner.py is missing - scanning disabled")
+            else:
+                ctx.escl = escl_scanner.EsclScanner(
+                    wia_name, get_display_name(printer_name, cfg),
+                    str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")))
+                logger.info("Scanner sharing enabled for WIA device: %s", wia_name)
+
+        mdns = MDNSAdvertiser(printer_name, host_ip, IPP_PORT, scanner=ctx.escl is not None, cfg=cfg, path_prefix=prefix)
+        mdns.register()
+        mdns_list.append(mdns)
+
+        if cfg.get("wsd") and wsd_device is not None:
+            display = get_display_name(printer_name, cfg)
+            model = str(cfg.get("wsd_model") or display)
+            maker = str(cfg.get("wsd_maker") or model.split()[0])
+            wsd_port = int(cfg.get("wsd_port") or IPP_PORT)
+            dev = wsd_device.WsdDevice(
+                str(cfg.get("wsd_uuid") or uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
+                host_ip, wsd_port, display, maker, model,
+                scanner=ctx.escl,
+                print_document=(lambda data, fmt, _p=printer_name: print_document_bytes(_p, data, fmt)),
+                path_prefix=prefix)
+            ctx.wsd = dev
+            wsd_devs.append(dev)
+
+    IPPRequestHandler.contexts = contexts
+    IPPRequestHandler.default_ctx = contexts[cfgs[0]["id"]]
 
     wsd_disc = None
-    if _load_config().get("wsd") and wsd_device is not None:
-        display = get_display_name(printer_name)
-        model = str(_load_config().get("wsd_model") or display)
-        maker = str(_load_config().get("wsd_maker") or model.split()[0])
-        wsd_port = int(_load_config().get("wsd_port") or IPP_PORT)
-        dev = wsd_device.WsdDevice(
-            str(_load_config().get("wsd_uuid") or uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
-            host_ip, wsd_port, display, maker, model,
-            scanner=IPPRequestHandler.escl,
-            print_document=lambda data, fmt: print_document_bytes(printer_name, data, fmt))
-        IPPRequestHandler.wsd = dev
+    if wsd_devs:
         try:
-            wsd_disc = wsd_device.WsDiscovery(dev)
+            wsd_disc = wsd_device.WsDiscovery(wsd_devs)
             wsd_disc.start()
         except Exception:  # noqa: BLE001
             logger.exception("WSD discovery could not start - WSD disabled")
-            IPPRequestHandler.wsd = None
+            for c in contexts.values():
+                c.wsd = None
 
     # ---- Start HTTP / IPP server ----
     server = ThreadedIPPServer(("0.0.0.0", IPP_PORT), IPPRequestHandler)
@@ -1866,20 +1961,21 @@ def main(shutdown_event: threading.Event) -> None:
 
     def _cleanup() -> None:
         """atexit hook — ensures mDNS is always unregistered."""
-        mdns.unregister()
+        for m in mdns_list:
+            m.unregister()
         if wsd_disc is not None:
             wsd_disc.stop()
         logger.info("AirPrint Bridge shut down cleanly.")
 
     atexit.register(_cleanup)
 
-    if IPPRequestHandler.wsd is not None and IPPRequestHandler.wsd.port != IPP_PORT:
+    for wp in sorted({d.port for d in wsd_devs if d.port != IPP_PORT}):
         try:
-            wsd_server = ThreadedIPPServer(("0.0.0.0", IPPRequestHandler.wsd.port), IPPRequestHandler)
+            wsd_server = ThreadedIPPServer(("0.0.0.0", wp), IPPRequestHandler)
             threading.Thread(target=wsd_server.serve_forever, daemon=True).start()
-            logger.info("WSD HTTP endpoint also listening on 0.0.0.0:%d", IPPRequestHandler.wsd.port)
+            logger.info("WSD HTTP endpoint also listening on 0.0.0.0:%d", wp)
         except OSError:
-            logger.exception("could not listen on WSD port %d", IPPRequestHandler.wsd.port)
+            logger.exception("could not listen on WSD port %d", wp)
 
     # Run the server in a background thread so we can wait on the event.
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
