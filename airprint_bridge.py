@@ -358,6 +358,43 @@ def get_display_name(printer_name: str) -> str:
     return str(_load_config().get("display_name") or printer_name)
 
 
+_MEDIA_ALIASES = {
+    "a4": "iso_a4_210x297mm", "a5": "iso_a5_148x210mm", "a6": "iso_a6_105x148mm",
+    "letter": "na_letter_8.5x11in", "legal": "na_legal_8.5x14in",
+}
+
+
+def get_default_paper() -> Optional[Tuple[str, Tuple[float, float]]]:
+    """
+    ``"default_paper": "A4"`` in config.json = the paper to use when the SENDER DOES NOT CHOOSE a size.
+    A job that names a size (Letter, 4x6, A5 ...) is always respected.  Without this setting a job with no
+    size copies the page size of the document itself - so a Letter file makes the printer stop and wait for
+    Letter paper.  Leave it unset on label printers (where copying the document size is what you want).
+    Accepts A4/A5/A6/Letter/Legal or a full IPP media keyword.  Returns (ipp_keyword, (w_mm, h_mm)) or None.
+    """
+    value = str(_load_config().get("default_paper") or "").strip()
+    if not value:
+        return None
+    key = _MEDIA_ALIASES.get(value.lower(), value)
+    size = IPP_MEDIA_SIZES.get(key)
+    if not size:
+        logger.warning("config.json default_paper=%r is not a known size - ignoring it", value)
+        return None
+    return key, size
+
+
+def choose_media_size(
+    requested_mm: Optional[Tuple[float, float]], sender_chose: bool,
+) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
+    """Return (size_to_use, note).  The configured default applies ONLY when the sender named no size."""
+    if requested_mm is not None or sender_chose:
+        return requested_mm, None
+    default = get_default_paper()
+    if default:
+        return default[1], default[0]
+    return None, None
+
+
 def get_target_printer() -> str:
     """
     Return the printer to share.
@@ -1017,6 +1054,9 @@ def _build_printer_attributes(
             win32print.ClosePrinter(hprinter)
     except Exception:
         pass
+    configured_default = get_default_paper()
+    if configured_default:
+        default_media = configured_default[0]                  # phones/PCs then offer it first
     logger.info("Active printer default media detected: %s", default_media)
 
     # Media & page size — advertise sizes with default_media first
@@ -1329,6 +1369,12 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                     )
             except (ValueError, TypeError):
                 pass
+
+        sender_chose = bool(media_keyword) or ("x-dimension" in job_attrs_parsed and "y-dimension" in job_attrs_parsed)
+        media_size_mm, default_used = choose_media_size(media_size_mm, sender_chose)
+        if default_used:
+            logger.info("Sender did not choose a paper size - using default_paper=%s (%.0f x %.0f mm)",
+                        default_used, media_size_mm[0], media_size_mm[1])
 
         doc_data = extract_document_data(raw)
         if not doc_data:

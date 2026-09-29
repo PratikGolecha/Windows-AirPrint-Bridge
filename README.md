@@ -132,6 +132,13 @@ python diagnose.py
 2. **IPP Binary Protocol:** The server implements a minimal IPP 1.1 / 2.0 binary protocol parser, handling `Print-Job`, `Validate-Job`, and `Get-Printer-Attributes` operations. It responds with mandatory and extended attributes required by modern iOS releases.
 3. **Print Spooling:** When a document is received, it is dumped to a temporary file. `win32ui` and `win32print` are used in combination with `fitz` (PyMuPDF) to draw the document natively into the printer's device context, bypassing the problematic shell-based PDF printing methods.
 
+## Default paper size — fork addition
+
+`"default_paper": "A4"` in `config.json` (also A5, A6, Letter, Legal, or an IPP keyword such as `iso_a4_210x297mm`): the paper used **only when the
+sender does not choose a size**, and the size advertised first to phones/PCs. A print that names a size (Letter, 4x6, A5 ...) is respected as before.
+Without it, a job with no size copies the document's own page size, so a Letter file makes an A4-loaded printer stop and wait for Letter paper.
+**Leave it unset on label/thermal printers**, where copying the document size is the wanted behaviour.
+
 ## Scanning (eSCL / AirScan) — fork addition
 
 Set `"scanner": "<WIA device name>"` in `config.json` (the scanner's name as Windows lists it,
