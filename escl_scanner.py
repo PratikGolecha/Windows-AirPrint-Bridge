@@ -34,6 +34,7 @@ WIA_INTENT_GRAY = 2
 RESOLUTIONS = (75, 100, 150, 200, 300, 600)
 # Platen size in 1/300 inch (A4 height, Letter width)
 MAX_W, MAX_H = 2550, 3508
+MAX_W_A4 = 2480                   # full glass width the driver returns (A4, 1/300 inch)
 
 SCAN_LOCK = threading.Lock()   # one physical scan at a time
 
@@ -205,14 +206,25 @@ class EsclScanner:
             return self.jobs.pop(job_id, None) is not None
 
     @staticmethod
-    def _as_jpeg(data: bytes, color: bool, dpi: int) -> bytes:
-        """WIA drivers often ignore the requested format and return a BMP/PNG.
-        Always hand clients a real JPEG (and honour grey if the driver did not)."""
+    def _as_jpeg(data: bytes, color: bool, dpi: int, region=None) -> bytes:
+        """WIA drivers often ignore the requested format and return a BMP/PNG, and
+        some mishandle crop settings.  So: scan the whole glass, crop the requested
+        region here (region is x, y, w, h in 1/300 inch) and always return a real JPEG."""
         from PIL import Image
 
         img = Image.open(io.BytesIO(data))
-        if data[:3] == b"\xff\xd8\xff" and (color or img.mode == "L"):
-            return data                                   # already a proper JPEG
+        cropped = False
+        if region:
+            x, y, w, h = region
+            k = img.width / float(MAX_W_A4)          # pixels per 1/300-inch unit
+            left, top = max(0, int(x * k)), max(0, int(y * k))
+            right, bottom = min(img.width, int((x + w) * k)), min(img.height, int((y + h) * k))
+            if right - left > 8 and bottom - top > 8 and (
+                    right - left < img.width * 0.97 or bottom - top < img.height * 0.97):
+                img = img.crop((left, top, right, bottom))
+                cropped = True
+        if not cropped and data[:3] == b"\xff\xd8\xff" and (color or img.mode == "L"):
+            return data                                   # already a proper JPEG, untouched
         img = img.convert("RGB" if color else "L")
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=85, dpi=(dpi, dpi))
@@ -248,16 +260,6 @@ class EsclScanner:
             setp("Horizontal Resolution", dpi)
             setp("Vertical Resolution", dpi)
             setp("Current Intent", WIA_INTENT_COLOR if settings["color"] else WIA_INTENT_GRAY)
-            region = settings.get("region")
-            if region:
-                x, y, w, h = region
-                if w < MAX_W - 20 or h < MAX_H - 20:            # skip "whole platen" requests
-                    k = dpi / 300.0
-                    setp("Horizontal Start Position", int(x * k))
-                    setp("Vertical Start Position", int(y * k))
-                    setp("Horizontal Extent", max(1, int(w * k)))
-                    setp("Vertical Extent", max(1, int(h * k)))
-
             image = item.Transfer(WIA_FORMAT_JPEG)
             fd, path = tempfile.mkstemp(suffix=".jpg")
             os.close(fd)
@@ -266,7 +268,7 @@ class EsclScanner:
                 image.SaveFile(path)
                 with open(path, "rb") as fh:
                     data = fh.read()
-                return self._as_jpeg(data, bool(settings["color"]), dpi)
+                return self._as_jpeg(data, bool(settings["color"]), dpi, settings.get("region"))
             finally:
                 if os.path.exists(path):
                     os.remove(path)
