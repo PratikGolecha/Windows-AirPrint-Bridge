@@ -204,6 +204,20 @@ class EsclScanner:
         with self._jobs_lock:
             return self.jobs.pop(job_id, None) is not None
 
+    @staticmethod
+    def _as_jpeg(data: bytes, color: bool, dpi: int) -> bytes:
+        """WIA drivers often ignore the requested format and return a BMP/PNG.
+        Always hand clients a real JPEG (and honour grey if the driver did not)."""
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(data))
+        if data[:3] == b"\xff\xd8\xff" and (color or img.mode == "L"):
+            return data                                   # already a proper JPEG
+        img = img.convert("RGB" if color else "L")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=85, dpi=(dpi, dpi))
+        return buf.getvalue()
+
     # ------------------------------------------------------------------ #
     # WIA                                                                 #
     # ------------------------------------------------------------------ #
@@ -251,7 +265,8 @@ class EsclScanner:
             try:
                 image.SaveFile(path)
                 with open(path, "rb") as fh:
-                    return fh.read()
+                    data = fh.read()
+                return self._as_jpeg(data, bool(settings["color"]), dpi)
             finally:
                 if os.path.exists(path):
                     os.remove(path)
