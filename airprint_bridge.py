@@ -1629,6 +1629,18 @@ class MDNSAdvertiser:
             "UUID": printer_uuid_str,
             "TLS": "none",
         }
+        if self._scanner:
+            # Tell clients this is a multifunction device (a real MFP like the Brothers announces these) so that
+            # Windows/Android/macOS treat the printer and the _uscan scanner (same UUID) as ONE device.
+            txt_props.update({
+                "Scan": "T",
+                "Fax": "F",
+                "Copies": "T",
+                "kind": "document,envelope,photo,postcard",
+                "PaperMax": "legal-A4",
+                "usb_MFG": "Canon",
+                "usb_MDL": "G4070 series",
+            })
 
         # --- Primary service: _ipp._tcp.local. ---
         self._info = ServiceInfo(
