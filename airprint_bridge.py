@@ -328,6 +328,31 @@ def get_default_printer() -> str:
     return name
 
 
+def _load_config() -> dict:
+    """Return the parsed ``config.json`` next to the script/exe (or ``{}``)."""
+    import json
+
+    config_path = _app_dir / "config.json"
+    if not config_path.is_file():
+        return {}
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.critical("Cannot read %s: %s", config_path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_display_name(printer_name: str) -> str:
+    """
+    Name shown to phones and tablets.
+
+    Defaults to the plain Windows printer name (no PC-name suffix).  Set
+    ``"display_name"`` in config.json to show something different.
+    """
+    return str(_load_config().get("display_name") or printer_name)
+
+
 def get_target_printer() -> str:
     """
     Return the printer to share.
@@ -336,15 +361,8 @@ def get_target_printer() -> str:
     that exact Windows printer name is used (and must exist).  Otherwise the
     Windows default printer is used, as before.
     """
-    import json
-
-    config_path = _app_dir / "config.json"
-    if config_path.is_file():
-        try:
-            configured = json.loads(config_path.read_text(encoding="utf-8")).get("printer", "")
-        except (OSError, ValueError) as exc:
-            logger.critical("Cannot read %s: %s", config_path, exc)
-            return ""
+    if (_app_dir / "config.json").is_file():
+        configured = _load_config().get("printer", "")
         if configured:
             flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
             installed = [p[2] for p in win32print.EnumPrinters(flags)]
@@ -911,7 +929,7 @@ def _build_printer_attributes(
     require in order to accept the printer as AirPrint-compatible.
     """
     hostname = socket.gethostname()
-    display_name = f"{printer_name} ({hostname})"
+    display_name = get_display_name(printer_name)
     printer_uri = f"ipp://{host_ip}:{IPP_PORT}/ipp/print"
     attrs = struct.pack("!B", IPP_TAG_PRINTER)
 
@@ -1462,7 +1480,7 @@ class MDNSAdvertiser:
     def register(self) -> None:
         """Broadcast the service on the LAN."""
         hostname = socket.gethostname()
-        display_name = f"{self._printer_name} ({hostname})"
+        display_name = get_display_name(self._printer_name)
 
         # Clean display name for mDNS instance label (allow spaces, escape dot/slashes, limit length)
         clean_instance = (
@@ -1489,7 +1507,6 @@ class MDNSAdvertiser:
             "rp": "ipp/print",
             "ty": display_name,
             "product": f"({self._printer_name})",
-            "note": f"AirPrint Bridge on {hostname}",
             "pdl": "application/pdf,image/urf,image/jpeg,image/png,image/pwg-raster",
             "Color": "T",                         # Must match SRGB24 in URF
             "Duplex": "F",

@@ -27,6 +27,20 @@ By strictly adhering to Apple AirPrint and standard IPP Everywhere requirements,
 > [!TIP]
 > **v1.3.1 Release Highlights:** v1.3.1 introduces a comprehensive fix for thermal label printers (like the Zebra ZD220D) and custom paper formats: full IPP `media-col` collection parsing, automatic PDF page dimension auto-detection, robust Win32 GDI printer form matching and DEVMODE configuration via `win32gui.CreateDC`, and thermal label aspect ratio preservation to guarantee 1:1 scale prints without shrinking.
 
+## Fork additions (PratikGolecha fork)
+
+- **Choose the printer** instead of using the Windows default: copy `config.json.example`
+  to `config.json` next to the script and set `"printer"` to the exact Windows printer name.
+  The bridge stops with a clear log message if that printer is not installed.
+- **Clean name on phones:** the name shown to phones/tablets is the printer name only
+  (no ` (PC-name)` suffix). Set `"display_name"` in `config.json` to show a different name.
+- **`requirements.txt` now lists PyMuPDF**, which the code imports for PDF rendering.
+- **USB printers using Microsoft's generic "IPP Class Driver" cannot be printed to from a
+  Windows service** (session 0): the job fails with `win32ui.error: EndPage failed (error code -1)`.
+  Run the bridge in the signed-in user's session instead, with `install-logon-task.ps1`
+  (a scheduled task that starts at logon). That PC then needs the user signed in
+  (auto-login) and sleep/hibernate disabled.
+
 ## Android Configuration (Important)
 
 Unlike iOS (where AirPrint is always enabled by default in the sharing sheet), **Android often has its built-in print service disabled by default** depending on the device manufacturer (e.g., Samsung, Xiaomi, OnePlus, Motorola).
