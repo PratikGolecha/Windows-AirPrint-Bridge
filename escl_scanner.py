@@ -223,7 +223,16 @@ class EsclScanner:
                     right - left < img.width * 0.97 or bottom - top < img.height * 0.97):
                 img = img.crop((left, top, right, bottom))
                 cropped = True
-        if not cropped and data[:3] == b"\xff\xd8\xff" and (color or img.mode == "L"):
+        # Some drivers ignore the requested resolution and snap to a supported one (Canon G4070: asked 100 dpi,
+        # got 300 dpi pixels).  Resample so the pixel size really matches the dpi we label the file with.
+        width_units = region[2] if (region and cropped) else MAX_W_A4          # 1/300 inch
+        expected_w = max(1, round(width_units * dpi / 300.0))
+        resized = False
+        if abs(img.width - expected_w) > expected_w * 0.05:
+            expected_h = max(1, round(img.height * expected_w / img.width))
+            img = img.resize((expected_w, expected_h), Image.LANCZOS)
+            resized = True
+        if not cropped and not resized and data[:3] == b"\xff\xd8\xff" and (color or img.mode == "L"):
             return data                                   # already a proper JPEG, untouched
         img = img.convert("RGB" if color else "L")
         buf = io.BytesIO()
