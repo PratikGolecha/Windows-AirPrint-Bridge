@@ -36,6 +36,10 @@ RESOLUTIONS = (75, 100, 150, 200, 300, 600)
 MAX_W, MAX_H = 2550, 3508
 MAX_W_A4 = 2480                   # full glass width the driver returns (A4, 1/300 inch)
 
+class FeederEmpty(RuntimeError):
+    pass
+
+
 SCAN_LOCK = threading.Lock()   # one physical scan at a time
 
 
@@ -204,20 +208,32 @@ class EsclScanner:
             try:
                 fmt = job["settings"]["format"]
 
+                pages: list = []
+
                 def add_page(jpeg: bytes) -> None:
                     if fmt == "application/pdf":
-                        from PIL import Image
-                        buf = io.BytesIO()
-                        Image.open(io.BytesIO(jpeg)).convert("RGB").save(
-                            buf, "PDF", resolution=float(job["settings"]["dpi"]))
-                        job["docs"].append((buf.getvalue(), "application/pdf"))
+                        pages.append(jpeg)                    # combined into ONE pdf when the job finishes
                     else:
                         job["docs"].append((jpeg, "image/jpeg"))
 
-                if job["settings"].get("source") == "feeder":
-                    self._wia_scan_feeder(job["settings"], add_page)
+                src = job["settings"].get("source")
+                if src in ("feeder", "auto"):
+                    try:
+                        self._wia_scan_feeder(job["settings"], add_page)
+                    except FeederEmpty:
+                        if src == "feeder":
+                            raise
+                        logger.info("auto source: feeder empty - using the flatbed")
+                        add_page(self._wia_scan(job["settings"]))
                 else:
                     add_page(self._wia_scan(job["settings"]))
+                if pages:
+                    from PIL import Image
+                    imgs = [Image.open(io.BytesIO(b)).convert("RGB") for b in pages]
+                    buf = io.BytesIO()
+                    imgs[0].save(buf, "PDF", resolution=float(job["settings"]["dpi"]),
+                                 save_all=True, append_images=imgs[1:])
+                    job["docs"].append((buf.getvalue(), "application/pdf"))
                 job["state"] = "done"
                 logger.info("scan job %s done: %d page(s)", job_id, len(job["docs"]))
             except Exception as exc:  # noqa: BLE001
@@ -387,7 +403,7 @@ class EsclScanner:
                 count += 1
                 logger.info("feeder: sheet %d scanned", count)
             if count == 0:
-                raise RuntimeError("the document feeder is empty")
+                raise FeederEmpty("the document feeder is empty")
         finally:
             try:
                 dev.Properties("Document Handling Select").Value = 2   # leave it on flatbed for the next user

@@ -286,12 +286,14 @@ class WsdDevice:
         dpi = min(SCAN_RESOLUTIONS, key=lambda r: abs(r - dpi))
         k = 300.0 / 1000.0                     # 1/1000 inch -> 1/300 inch
         full = (x == 0 and y == 0 and w >= SCAN_MAX_W - 10 and h >= SCAN_MAX_H - 10)
-        src = find_text(bel, "InputSource", "Platen")
+        src = find_text(bel, "InputSource", "")
+        auto = not src or src.lower() == "auto"        # Scan app "Auto": the ticket names no source - the scanner decides
+        src = src or "Auto"
         try:
-            images = int(find_text(bel, "ImagesToTransfer", "1"))
+            images = int(find_text(bel, "ImagesToTransfer", "0" if auto else "1"))
         except ValueError:
             images = 1
-        return {"source": "feeder" if src.upper().startswith("ADF") else "platen", "srcname": src, "images": images,
+        return {"source": "auto" if auto else ("feeder" if src.upper().startswith("ADF") else "platen"), "srcname": src, "auto": auto, "images": images,
                 "color": color.upper().startswith("RGB"), "colorname": color, "dpi": dpi,
                 "x": x, "y": y, "w": w, "h": h,
                 "region300": None if full else (round(x * k), round(y * k), max(1, round(w * k)), max(1, round(h * k)))}
@@ -318,7 +320,7 @@ class WsdDevice:
     def _final_params(self, t: dict) -> str:
         return (f'<wscn:DocumentFinalParameters><wscn:Format>exif</wscn:Format>'
                 f'<wscn:CompressionQualityFactor wscn:UsedDefault="true">100</wscn:CompressionQualityFactor>'
-                f'<wscn:ImagesToTransfer>{t["images"] if t["source"] == "feeder" else 1}</wscn:ImagesToTransfer><wscn:InputSource>{escape(t["srcname"])}</wscn:InputSource>'
+                f'<wscn:ImagesToTransfer>{t["images"] if t["source"] == "feeder" else 1}</wscn:ImagesToTransfer><wscn:InputSource>{"Platen" if t["auto"] else escape(t["srcname"])}</wscn:InputSource>'
                 f'<wscn:ContentType wscn:UsedDefault="true">Auto</wscn:ContentType>'
                 f'<wscn:InputSize><wscn:InputMediaSize><wscn:Width>{SCAN_MAX_W}</wscn:Width><wscn:Height>{SCAN_MAX_H}</wscn:Height>'
                 f'</wscn:InputMediaSize></wscn:InputSize>'
