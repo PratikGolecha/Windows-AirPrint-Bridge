@@ -328,6 +328,37 @@ def get_default_printer() -> str:
     return name
 
 
+def get_target_printer() -> str:
+    """
+    Return the printer to share.
+
+    If a ``config.json`` next to the script/exe contains ``{"printer": "<name>"}``
+    that exact Windows printer name is used (and must exist).  Otherwise the
+    Windows default printer is used, as before.
+    """
+    import json
+
+    config_path = _app_dir / "config.json"
+    if config_path.is_file():
+        try:
+            configured = json.loads(config_path.read_text(encoding="utf-8")).get("printer", "")
+        except (OSError, ValueError) as exc:
+            logger.critical("Cannot read %s: %s", config_path, exc)
+            return ""
+        if configured:
+            flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+            installed = [p[2] for p in win32print.EnumPrinters(flags)]
+            if configured not in installed:
+                logger.critical(
+                    "Configured printer %r not found. Installed printers: %s",
+                    configured, installed,
+                )
+                return ""
+            logger.info("Using printer from config.json: %s", configured)
+            return configured
+    return get_default_printer()
+
+
 def spool_to_printer(
     file_path: str,
     printer_name: str,
@@ -1556,9 +1587,9 @@ def main(shutdown_event: threading.Event) -> None:
 
     # ---- Detect environment ----
     host_ip = get_local_ip()
-    printer_name = get_default_printer()
+    printer_name = get_target_printer()
     if not printer_name:
-        logger.critical("No default printer configured — aborting.")
+        logger.critical("No usable printer (config.json or Windows default) — aborting.")
         sys.exit(1)
 
     # ---- Configure the request handler class ----
