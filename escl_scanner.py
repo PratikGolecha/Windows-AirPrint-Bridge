@@ -67,6 +67,8 @@ def parse_scan_settings(xml_bytes: bytes) -> Dict[str, object]:
             elif name in ("DocumentFormat", "DocumentFormatExt"):
                 if text in ("application/pdf", "image/jpeg"):
                     s["format"] = text
+            elif name == "InputSource":
+                s["source"] = "feeder" if text.lower().startswith(("feeder", "adf")) else "platen"
             elif name in ("Width", "Height", "XOffset", "YOffset"):
                 region[name] = int(text)
         except ValueError:
@@ -129,6 +131,35 @@ class EsclScanner:
    </scan:SupportedIntents>
   </scan:PlatenInputCaps>
  </scan:Platen>
+ <scan:Adf>
+  <scan:AdfSimplexInputCaps>
+   <scan:MinWidth>16</scan:MinWidth>
+   <scan:MaxWidth>{MAX_W}</scan:MaxWidth>
+   <scan:MinHeight>16</scan:MinHeight>
+   <scan:MaxHeight>{MAX_H}</scan:MaxHeight>
+   <scan:MaxScanRegions>1</scan:MaxScanRegions>
+   <scan:SettingProfiles>
+    <scan:SettingProfile>
+     <scan:ColorModes>
+      <scan:ColorMode>RGB24</scan:ColorMode>
+      <scan:ColorMode>Grayscale8</scan:ColorMode>
+     </scan:ColorModes>
+     <scan:DocumentFormats>
+      <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+      <pwg:DocumentFormat>application/pdf</pwg:DocumentFormat>
+     </scan:DocumentFormats>
+     <scan:SupportedResolutions>
+      <scan:DiscreteResolutions>{res}</scan:DiscreteResolutions>
+     </scan:SupportedResolutions>
+    </scan:SettingProfile>
+   </scan:SettingProfiles>
+   <scan:SupportedIntents>
+    <scan:Intent>Document</scan:Intent>
+    <scan:Intent>TextAndGraphic</scan:Intent>
+    <scan:Intent>Photo</scan:Intent>
+   </scan:SupportedIntents>
+  </scan:AdfSimplexInputCaps>
+ </scan:Adf>
 </scan:ScannerCapabilities>"""
         return xml.encode("utf-8")
 
@@ -151,7 +182,7 @@ class EsclScanner:
         job_id = str(uuid.uuid4())
         job = {"settings": settings, "state": "pending", "data": None,
                "mime": settings["format"], "error": "", "delivered": False,
-               "created": time.time()}
+               "docs": [], "next": 0, "created": time.time()}
         with self._jobs_lock:
             self._prune()
             self.jobs[job_id] = job
@@ -171,33 +202,42 @@ class EsclScanner:
         with SCAN_LOCK:
             job["state"] = "scanning"
             try:
-                jpeg = self._wia_scan(job["settings"])
-                if job["settings"]["format"] == "application/pdf":
-                    from PIL import Image
-                    buf = io.BytesIO()
-                    Image.open(io.BytesIO(jpeg)).convert("RGB").save(
-                        buf, "PDF", resolution=float(job["settings"]["dpi"]))
-                    job["data"], job["mime"] = buf.getvalue(), "application/pdf"
+                fmt = job["settings"]["format"]
+
+                def add_page(jpeg: bytes) -> None:
+                    if fmt == "application/pdf":
+                        from PIL import Image
+                        buf = io.BytesIO()
+                        Image.open(io.BytesIO(jpeg)).convert("RGB").save(
+                            buf, "PDF", resolution=float(job["settings"]["dpi"]))
+                        job["docs"].append((buf.getvalue(), "application/pdf"))
+                    else:
+                        job["docs"].append((jpeg, "image/jpeg"))
+
+                if job["settings"].get("source") == "feeder":
+                    self._wia_scan_feeder(job["settings"], add_page)
                 else:
-                    job["data"], job["mime"] = jpeg, "image/jpeg"
+                    add_page(self._wia_scan(job["settings"]))
                 job["state"] = "done"
-                logger.info("eSCL job %s done: %d bytes %s", job_id, len(job["data"]), job["mime"])
+                logger.info("scan job %s done: %d page(s)", job_id, len(job["docs"]))
             except Exception as exc:  # noqa: BLE001
                 job["state"], job["error"] = "error", str(exc)
-                logger.exception("eSCL job %s failed", job_id)
+                logger.exception("scan job %s failed", job_id)
 
     def next_document(self, job_id: str, timeout: float = 150.0) -> Optional[Tuple[bytes, str]]:
-        """Block until the page is ready. None = no (more) documents."""
+        """Block until the next page is ready. None = no (more) documents."""
         job = self.jobs.get(job_id)
         if not job:
             return None
         end = time.time() + timeout
-        while job["state"] in ("pending", "scanning") and time.time() < end:
+        while len(job["docs"]) <= job["next"] and job["state"] in ("pending", "scanning") and time.time() < end:
             time.sleep(0.25)
-        if job["state"] != "done" or job["delivered"]:
+        if len(job["docs"]) <= job["next"]:
             return None
+        doc = job["docs"][job["next"]]
+        job["next"] += 1
         job["delivered"] = True
-        return job["data"], job["mime"]
+        return doc
 
     def job_error(self, job_id: str) -> str:
         job = self.jobs.get(job_id)
@@ -259,6 +299,10 @@ class EsclScanner:
             if dev is None:
                 raise RuntimeError(f"WIA scanner '{self.wia_name}' not found")
             item = dev.Items.Item(1)
+            try:
+                dev.Properties("Document Handling Select").Value = 2      # 2 = flatbed (the setting persists in the driver)
+            except Exception:  # noqa: BLE001
+                pass
 
             dpi = int(settings["dpi"])
 
@@ -284,4 +328,69 @@ class EsclScanner:
                 if os.path.exists(path):
                     os.remove(path)
         finally:
+            pythoncom.CoUninitialize()
+
+    def _wia_scan_feeder(self, settings: Dict[str, object], add_page) -> None:
+        """Scan every sheet in the automatic document feeder; add_page(jpeg) is called per sheet."""
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        try:
+            dm = win32com.client.Dispatch("WIA.DeviceManager")
+            dev = None
+            for info in dm.DeviceInfos:
+                if info.Type == WIA_TYPE_SCANNER and info.Properties("Name").Value == self.wia_name:
+                    dev = info.Connect()
+                    break
+            if dev is None:
+                raise RuntimeError(f"WIA scanner '{self.wia_name}' not found")
+            for name, value in (("Document Handling Select", 1),):     # 1 = feeder; sheet by sheet until the tray is empty
+                try:
+                    dev.Properties(name).Value = value
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("WIA feeder: could not set %r=%r (%s)", name, value, exc)
+            item = dev.Items.Item(1)
+            dpi = int(settings["dpi"])
+            for name, value in (("Horizontal Resolution", dpi), ("Vertical Resolution", dpi),
+                                ("Current Intent", WIA_INTENT_COLOR if settings["color"] else WIA_INTENT_GRAY)):
+                try:
+                    item.Properties(name).Value = value
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("WIA feeder: could not set %r=%r (%s)", name, value, exc)
+            count = 0
+            limit = int(settings.get("max_pages") or 0) or 200
+            while count < limit:
+                try:
+                    image = item.Transfer(WIA_FORMAT_JPEG)
+                except Exception as exc:  # noqa: BLE001
+                    code = (getattr(exc, "hresult", None) or (exc.args[0] if exc.args else 0)) & 0xFFFFFFFF
+                    sub = 0
+                    try:
+                        sub = (exc.excepinfo[5] or 0) & 0xFFFFFFFF
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if 0x80210003 in (code, sub):                      # WIA_ERROR_PAPER_EMPTY = feeder ran out
+                        break
+                    raise
+                fd, path = tempfile.mkstemp(suffix=".jpg")
+                os.close(fd)
+                os.remove(path)
+                try:
+                    image.SaveFile(path)
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                finally:
+                    if os.path.exists(path):
+                        os.remove(path)
+                add_page(self._as_jpeg(data, bool(settings["color"]), dpi, settings.get("region")))
+                count += 1
+                logger.info("feeder: sheet %d scanned", count)
+            if count == 0:
+                raise RuntimeError("the document feeder is empty")
+        finally:
+            try:
+                dev.Properties("Document Handling Select").Value = 2   # leave it on flatbed for the next user
+            except Exception:  # noqa: BLE001
+                pass
             pythoncom.CoUninitialize()

@@ -727,6 +727,29 @@ def _encode_range_attribute(name: str, lower: int, upper: int) -> bytes:
     )
 
 
+def _ipp_collection(name: str, members) -> bytes:
+    """Encode a collection attribute. members = [(member_name, value_tag, value_bytes | nested_members)]."""
+    def body(items) -> bytes:
+        out = b""
+        for mname, tag, val in items:
+            out += struct.pack("!BH", IPP_TAG_MEMBER_ATTR_NAME, 0) + struct.pack("!H", len(mname)) + mname.encode()
+            if tag == IPP_TAG_BEG_COLLECTION:
+                out += struct.pack("!BHH", IPP_TAG_BEG_COLLECTION, 0, 0) + body(val) + struct.pack("!BHH", IPP_TAG_END_COLLECTION, 0, 0)
+                out += struct.pack("!BHH", 0x4A, 0, 0) if False else b""
+            else:
+                out += struct.pack("!BH", tag, 0) + struct.pack("!H", len(val)) + val
+        return out
+    return (struct.pack("!B", IPP_TAG_BEG_COLLECTION) + struct.pack("!H", len(name)) + name.encode() + struct.pack("!H", 0)
+            + body(members) + struct.pack("!BHH", IPP_TAG_END_COLLECTION, 0, 0))
+
+
+def _media_col(media_key: str) -> list:
+    w, h = IPP_MEDIA_SIZES.get(media_key, (210.0, 297.0))
+    return [("media-size", IPP_TAG_BEG_COLLECTION, [
+                ("x-dimension", IPP_TAG_INTEGER, struct.pack("!i", int(round(w * 100)))),
+                ("y-dimension", IPP_TAG_INTEGER, struct.pack("!i", int(round(h * 100))))])]
+
+
 def _encode_additional_value(value_tag: int, value: bytes) -> bytes:
     """
     Encode an *additional value* for a multi-valued attribute.
@@ -1101,6 +1124,8 @@ def _build_printer_attributes(
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-col-supported", "media-size")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-type")
     attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-source")
+    attrs += _ipp_collection("media-col-default", _media_col(unique_media[0]))
+    attrs += _ipp_collection("media-col-ready", _media_col(unique_media[0]))
 
     # Sides (duplex) — we report simplex only for safety
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "sides-default", "one-sided")

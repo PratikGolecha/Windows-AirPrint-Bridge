@@ -166,9 +166,10 @@ class WsdDevice:
     def _ok(b: bytes, ctype: str = "application/soap+xml; charset=utf-8", headers=None):
         return 200, ctype, b, headers or {}
 
-    def _fault(self, mid: str, code: str, sub: str):
+    def _fault(self, mid: str, code: str, sub: str, ns: str = "wsa"):
+        nsdecl = f' xmlns:wscn="{NS_WSCN}"' if ns == "wscn" else ""
         body = (f'<SOAP-ENV:Fault><SOAP-ENV:Code><SOAP-ENV:Value>SOAP-ENV:{code}</SOAP-ENV:Value>'
-                f'<SOAP-ENV:Subcode><SOAP-ENV:Value>wsa:{sub}</SOAP-ENV:Value></SOAP-ENV:Subcode></SOAP-ENV:Code>'
+                f'<SOAP-ENV:Subcode><SOAP-ENV:Value{nsdecl}>{ns}:{sub}</SOAP-ENV:Value></SOAP-ENV:Subcode></SOAP-ENV:Code>'
                 f'<SOAP-ENV:Reason><SOAP-ENV:Text xml:lang="en">{sub}</SOAP-ENV:Text></SOAP-ENV:Reason></SOAP-ENV:Fault>')
         return 500, "application/soap+xml; charset=utf-8", envelope(NS_WSA + "/fault", mid, body), {}
 
@@ -239,11 +240,12 @@ class WsdDevice:
                                      f"{self._image_info(t)}</wscn:ValidationInfo></wscn:ValidateScanTicketResponse>"))
         if name == "CreateScanJob":
             t = self._ticket(bel)
+            logger.info("WSD CreateScanJob request: %s", ET.tostring(bel, encoding="unicode")[:1500] if bel is not None else "")
             with self._lock:
                 jid = self._next_job
                 self._next_job += 1
             token = f"urn:uuid:{uuid.uuid4()}"
-            settings = {"dpi": t["dpi"], "color": t["color"], "format": "image/jpeg", "region": t["region300"]}
+            settings = {"dpi": t["dpi"], "color": t["color"], "format": "image/jpeg", "region": t["region300"], "source": t["source"], "max_pages": t["images"]}
             esc_id = self.scanner.create_job_settings(settings)
             self.scan_jobs[jid] = {"token": token, "esc": esc_id, "ticket": t, "created": time.time()}
             logger.info("WSD scan job %d -> %s", jid, t)
@@ -256,8 +258,10 @@ class WsdDevice:
             doc = self.scanner.next_document(job["esc"]) if job else None
             if doc is None:
                 err = self.scanner.job_error(job["esc"]) if job else "unknown job"
-                logger.warning("WSD RetrieveImage job %s: no image (%s)", jid, err)
-                return self._fault(mid, "Sender", "ClientErrorNoImagesAvailable")
+                logger.info("WSD RetrieveImage job %s: no (more) images (%s)", jid, err)
+                if err:
+                    return self._fault(mid, "Receiver", "ServerErrorScanFailure", "wscn")
+                return self._fault(mid, "Sender", "ClientErrorNoImagesAvailable", "wscn")
             return self._mtom_image(mid, doc[0])
         if name in ("CancelJob",):
             jid = int(find_text(bel, "JobId", "0") or 0)
@@ -282,7 +286,13 @@ class WsdDevice:
         dpi = min(SCAN_RESOLUTIONS, key=lambda r: abs(r - dpi))
         k = 300.0 / 1000.0                     # 1/1000 inch -> 1/300 inch
         full = (x == 0 and y == 0 and w >= SCAN_MAX_W - 10 and h >= SCAN_MAX_H - 10)
-        return {"color": color.upper().startswith("RGB"), "colorname": color, "dpi": dpi,
+        src = find_text(bel, "InputSource", "Platen")
+        try:
+            images = int(find_text(bel, "ImagesToTransfer", "1"))
+        except ValueError:
+            images = 1
+        return {"source": "feeder" if src.upper().startswith("ADF") else "platen", "srcname": src, "images": images,
+                "color": color.upper().startswith("RGB"), "colorname": color, "dpi": dpi,
                 "x": x, "y": y, "w": w, "h": h,
                 "region300": None if full else (round(x * k), round(y * k), max(1, round(w * k)), max(1, round(h * k)))}
 
@@ -308,7 +318,7 @@ class WsdDevice:
     def _final_params(self, t: dict) -> str:
         return (f'<wscn:DocumentFinalParameters><wscn:Format>exif</wscn:Format>'
                 f'<wscn:CompressionQualityFactor wscn:UsedDefault="true">100</wscn:CompressionQualityFactor>'
-                f'<wscn:ImagesToTransfer>1</wscn:ImagesToTransfer><wscn:InputSource>Platen</wscn:InputSource>'
+                f'<wscn:ImagesToTransfer>{t["images"] if t["source"] == "feeder" else 1}</wscn:ImagesToTransfer><wscn:InputSource>{escape(t["srcname"])}</wscn:InputSource>'
                 f'<wscn:ContentType wscn:UsedDefault="true">Auto</wscn:ContentType>'
                 f'<wscn:InputSize><wscn:InputMediaSize><wscn:Width>{SCAN_MAX_W}</wscn:Width><wscn:Height>{SCAN_MAX_H}</wscn:Height>'
                 f'</wscn:InputMediaSize></wscn:InputSize>'
@@ -364,6 +374,13 @@ class WsdDevice:
 <wscn:PlatenMinimumSize><wscn:Width>556</wscn:Width><wscn:Height>556</wscn:Height></wscn:PlatenMinimumSize>
 <wscn:PlatenMaximumSize><wscn:Width>{SCAN_MAX_W}</wscn:Width><wscn:Height>{SCAN_MAX_H}</wscn:Height></wscn:PlatenMaximumSize>
 </wscn:Platen>
+<wscn:ADF><wscn:ADFSupportsDuplex>0</wscn:ADFSupportsDuplex><wscn:ADFFront>
+<wscn:ADFOpticalResolution><wscn:Width>600</wscn:Width><wscn:Height>600</wscn:Height></wscn:ADFOpticalResolution>
+<wscn:ADFResolutions><wscn:Widths>{res_w}</wscn:Widths><wscn:Heights>{res_h}</wscn:Heights></wscn:ADFResolutions>
+<wscn:ADFColor>{color}</wscn:ADFColor>
+<wscn:ADFMinimumSize><wscn:Width>556</wscn:Width><wscn:Height>556</wscn:Height></wscn:ADFMinimumSize>
+<wscn:ADFMaximumSize><wscn:Width>{SCAN_MAX_W}</wscn:Width><wscn:Height>{SCAN_MAX_H}</wscn:Height></wscn:ADFMaximumSize>
+</wscn:ADFFront></wscn:ADF>
 </wscn:ScannerConfiguration></wscn:ElementData>
 <wscn:ElementData Name="wscn:ScannerStatus" Valid="true"><wscn:ScannerStatus><wscn:ScannerCurrentTime>{time.strftime('%Y-%m-%dT%H:%M:%S')}</wscn:ScannerCurrentTime><wscn:ScannerState>Idle</wscn:ScannerState><wscn:ActiveConditions/></wscn:ScannerStatus></wscn:ElementData>
 <wscn:ElementData Name="wscn:DefaultScanTicket" Valid="true"><wscn:DefaultScanTicket>
