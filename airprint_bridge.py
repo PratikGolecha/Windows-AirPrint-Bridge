@@ -445,6 +445,16 @@ def get_printer_configs() -> list:
     return out
 
 
+def printer_is_color(printer_name: str, cfg: Optional[dict] = None) -> bool:
+    """Is this a colour printer?  config ``"color": true|false`` wins; otherwise ask the Windows driver."""
+    if cfg is not None and cfg.get("color") is not None:
+        return bool(cfg.get("color"))
+    try:
+        return win32print.DeviceCapabilities(printer_name, "", 32) == 1          # 32 = DC_COLORDEVICE
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def get_target_printer() -> str:
     """
     Return the printer to share.
@@ -473,6 +483,7 @@ def spool_to_printer(
     file_path: str,
     printer_name: str,
     media_size_mm: Optional[Tuple[float, float]] = None,
+    color_mode: str = "",
 ) -> None:
     """
     Send *file_path* to the Windows print queue of *printer_name*.
@@ -611,6 +622,17 @@ def spool_to_printer(
                         "Failed to configure DEVMODE for media size — falling back to driver defaults"
                     )
                     devmode = None
+
+            # Colour / monochrome as chosen by the sender (print-color-mode); "auto" or nothing = the driver default
+            if color_mode in ("color", "monochrome"):
+                try:
+                    if devmode is None:
+                        devmode = win32print.GetPrinter(hprinter, 2)["pDevMode"]
+                    devmode.Color = win32con.DMCOLOR_MONOCHROME if color_mode == "monochrome" else win32con.DMCOLOR_COLOR
+                    devmode.Fields |= win32con.DM_COLOR
+                    logger.info("Print colour mode set to %s", color_mode)
+                except Exception:  # noqa: BLE001
+                    logger.exception("could not set the colour mode - using the driver default")
 
             # ----------------------------------------------------------
             # Create the printer DC (using win32gui.CreateDC with devmode)
@@ -1095,7 +1117,15 @@ def _build_printer_attributes(
     attrs += _encode_text_attribute(IPP_TAG_LANGUAGE, "generated-natural-language-supported", "en-us")
 
     # Color support — MUST be boolean per IPP spec; iOS rejects keyword encoding.
-    attrs += _encode_boolean_attribute("color-supported", False)
+    is_color = printer_is_color(printer_name, cfg)
+    attrs += _encode_boolean_attribute("color-supported", is_color)
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-default", "auto" if is_color else "monochrome")
+    if is_color:
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-supported", "auto")
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"color")
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"monochrome")
+    else:
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-supported", "monochrome")
 
     # Pages-per-minute (informational)
     attrs += _encode_integer_attribute("pages-per-minute", 10)
@@ -1525,7 +1555,8 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 logger.info("Spool path after conversion: %s", spool_path)
 
             # Spool — pass the media size so the printer DC gets the right DEVMODE
-            spool_to_printer(spool_path, self.printer_name, media_size_mm=media_size_mm)
+            spool_to_printer(spool_path, self.printer_name, media_size_mm=media_size_mm,
+                            color_mode=job_attrs_parsed.get("print-color-mode", ""))
 
 
         except OSError:
@@ -1770,7 +1801,7 @@ class MDNSAdvertiser:
             "ty": display_name,
             "product": f"({self._printer_name})",
             "pdl": "application/pdf,image/urf,image/jpeg,image/png,image/pwg-raster",
-            "Color": "T",                         # Must match SRGB24 in URF
+            "Color": "T" if printer_is_color(self._printer_name, self._cfg) else "F",   # Must match SRGB24 in URF
             "Duplex": "F",
             "adminurl": f"http://{self._host_ip}:{self._port}/",
             "priority": "50",
