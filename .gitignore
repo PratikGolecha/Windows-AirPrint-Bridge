@@ -13,3 +13,12 @@ __pycache__/
 # Environment
 .env
 
+
+# runtime files written by the bridge
+config.json
+jobs.json
+driver-caps/
+_printschema.ps1
+maintenance-learned.json
+airprint_bridge.log*
+job-hang.log

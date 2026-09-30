@@ -278,6 +278,12 @@ class WsdDevice:
                                      "<wscn:GetActiveJobsResponse><wscn:ActiveJobs/></wscn:GetActiveJobsResponse>"))
         return None
 
+    def _scan_resolutions(self) -> tuple:
+        try:
+            return tuple(self.scanner.resolutions())
+        except Exception:  # noqa: BLE001
+            return SCAN_RESOLUTIONS
+
     def _ticket(self, bel) -> dict:
         color = find_text(bel, "ColorProcessing", "RGB24")
         dpi = self._res(bel)
@@ -286,7 +292,7 @@ class WsdDevice:
         w = int(find_text(bel, "ScanRegionWidth", str(SCAN_MAX_W)))
         h = int(find_text(bel, "ScanRegionHeight", str(SCAN_MAX_H)))
         w, h = min(w, SCAN_MAX_W), min(h, SCAN_MAX_H)
-        dpi = min(SCAN_RESOLUTIONS, key=lambda r: abs(r - dpi))
+        dpi = min(self._scan_resolutions(), key=lambda r: abs(r - dpi))
         k = 300.0 / 1000.0                     # 1/1000 inch -> 1/300 inch
         full = (x == 0 and y == 0 and w >= SCAN_MAX_W - 10 and h >= SCAN_MAX_H - 10)
         src = find_text(bel, "InputSource", "")
@@ -355,8 +361,8 @@ class WsdDevice:
         return 200, ctype, payload, {}
 
     def _scanner_elements(self, sname: str) -> str:
-        res_w = "".join(f"<wscn:Width>{r}</wscn:Width>" for r in SCAN_RESOLUTIONS)
-        res_h = "".join(f"<wscn:Height>{r}</wscn:Height>" for r in SCAN_RESOLUTIONS)
+        res_w = "".join(f"<wscn:Width>{r}</wscn:Width>" for r in self._scan_resolutions())
+        res_h = "".join(f"<wscn:Height>{r}</wscn:Height>" for r in self._scan_resolutions())
         color = "<wscn:ColorEntry>Grayscale8</wscn:ColorEntry><wscn:ColorEntry>RGB24</wscn:ColorEntry>"
         adf_xml = f"""<wscn:ADF><wscn:ADFSupportsDuplex>0</wscn:ADFSupportsDuplex><wscn:ADFFront>
 <wscn:ADFOpticalResolution><wscn:Width>600</wscn:Width><wscn:Height>600</wscn:Height></wscn:ADFOpticalResolution>

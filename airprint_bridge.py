@@ -26,6 +26,7 @@ import hashlib
 import html
 import logging
 import os
+import re
 import signal
 import socket
 import struct
@@ -54,8 +55,12 @@ except ImportError:                    # spool_to_printer reports a clear error 
     pass
 
 import job_tracking
+import webui                       # web admin page + JSON API (webui.py)
+import maintenance                 # nozzle check / cleaning ... as RAW jobs (maintenance.py)
+import supplies                    # ink/toner levels from the printer's network side (supplies.py)
+import driver_caps                 # what the printer's own driver can do (media types, borderless, quality ...)
 
-JOBS = job_tracking.JobTracker()       # IPP job ids/states (see job_tracking.py)
+JOBS = job_tracking.JobTracker(path=str(Path(sys.executable).resolve().parent / 'jobs.json') if getattr(sys, 'frozen', False) else str(Path(__file__).resolve().parent / 'jobs.json'))       # IPP job ids/states (see job_tracking.py)
 
 try:
     import wsd_device
@@ -158,7 +163,8 @@ LOG_FILE: str = str(_app_dir / "airprint_bridge.log")
 logger = logging.getLogger("airprint_bridge")
 logger.setLevel(logging.DEBUG)
 
-_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+import logging.handlers
+_file_handler = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=4, encoding="utf-8")
 _file_handler.setLevel(logging.DEBUG)
 _file_handler.setFormatter(
     logging.Formatter(
@@ -494,6 +500,113 @@ def get_target_printer() -> str:
     return get_default_printer()
 
 
+def _select_pages(total: int, ranges: str) -> list:
+    """0-based page indexes for an IPP page-ranges string like '1-3,5-5' (empty = all pages)."""
+    if not ranges:
+        return list(range(total))
+    wanted = set()
+    for part in str(ranges).split(","):
+        try:
+            lo, hi = (int(x) for x in part.split("-"))
+        except ValueError:
+            continue
+        wanted.update(range(max(1, lo), min(hi, total) + 1))
+    return [i for i in range(total) if (i + 1) in wanted] or list(range(total))
+
+
+def _best_grid(n: int, sheet_w: float, sheet_h: float, page_w: float, page_h: float) -> Tuple[int, int]:
+    """(columns, rows) that make n pages as large as possible on the sheet."""
+    best, best_key = (1, n), (-1.0, 0)
+    for cols in range(1, n + 1):
+        rows = -(-n // cols)
+        scale = min(sheet_w / cols / page_w, sheet_h / rows / page_h)
+        key = (round(scale, 4), -(cols * rows))
+        if key > best_key:
+            best, best_key = (cols, rows), key
+    return best
+
+
+def job_options(attrs: dict) -> dict:
+    """The per-job choices the bridge applies itself or hands to the driver, from the parsed IPP attributes."""
+    margins = [attrs.get(k) for k in ("media-top-margin", "media-bottom-margin", "media-left-margin", "media-right-margin")]
+    borderless = all(m == "0" for m in margins) or "borderless" in str(attrs.get("media", "")).lower()
+    try:
+        number_up = int(attrs.get("number-up", "1") or 1)
+    except ValueError:
+        number_up = 1
+    scaling = attrs.get("print-scaling", "auto")
+    return {"media_type": attrs.get("media-type", ""), "borderless": borderless,
+            "sides": attrs.get("sides", "one-sided"), "media_source": attrs.get("media-source", ""),
+            "reverse": attrs.get("page-delivery", "") == "reverse-order",
+            "uncollated": attrs.get("sheet-collate", "") == "uncollated",
+            "page_ranges": attrs.get("page-ranges", ""), "number_up": number_up,
+            "scaling": scaling if scaling in ("auto", "fit", "fill", "none") else "auto"}
+
+
+def _dc_from_driver_features(printer_name: str, media_size_mm, color_mode: str, quality: str, opts: dict):
+    """Printer DC built from the driver's own settings (media type, borderless, quality ...) via a PrintTicket.
+    None when nothing special was asked for, the driver has no Print Schema, or Windows refused the combination -
+    the caller then uses its plain DEVMODE path."""
+    two_sided = opts.get("sides", "one-sided") not in ("", "one-sided")
+    tray = opts.get("media_source") not in ("", "auto", None)
+    wants = opts.get("media_type") or opts.get("borderless") or str(quality) in ("3", "5") or two_sided or tray
+    if not wants:
+        return None
+    try:
+        caps = driver_caps.load(printer_name)
+        if caps is None:
+            return None
+        choices = {}
+        mt = caps.media_type_option(opts.get("media_type", "")) if opts.get("media_type") else None
+        if mt:
+            choices["psk:PageMediaType"] = mt
+        if opts.get("borderless") and caps.borderless_supported():
+            choices["psk:PageBorderless"] = next(o["name"] for o in caps.options("psk:PageBorderless")
+                                                  if o["name"].lower().endswith(":borderless"))
+        q = caps.quality_options().get(int(quality)) if str(quality).isdigit() else None
+        if q:
+            choices["psk:PageOutputQuality"] = q
+        if two_sided:
+            d = caps.duplex_options().get(opts["sides"])
+            if d:
+                choices["psk:JobDuplexAllDocumentsContiguously"] = d
+        if tray:
+            b = caps.input_bin_option(opts["media_source"])
+            if b:
+                choices["psk:JobInputBin"] = b
+        if color_mode in ("color", "monochrome"):
+            c = caps.color_option(color_mode == "monochrome")
+            if c:
+                choices["psk:PageOutputColor"] = c
+        if media_size_mm:
+            w, h = media_size_mm
+            so = caps.size_option(min(w, h), max(w, h))
+            if so:
+                choices["psk:PageMediaSize"] = so
+            if "psk:PageOrientation" in caps.features:
+                choices["psk:PageOrientation"] = "psk:Landscape" if w > h else "psk:Portrait"
+        if not choices:
+            return None
+        dm = caps.devmode(choices)
+        if not dm:
+            return None
+        import ctypes
+        from ctypes import wintypes
+        gdi = ctypes.windll.gdi32
+        gdi.CreateDCW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p]
+        gdi.CreateDCW.restype = wintypes.HDC
+        buf = ctypes.create_string_buffer(dm, len(dm))
+        handle = gdi.CreateDCW("WINSPOOL", printer_name, None, ctypes.cast(buf, ctypes.c_void_p))
+        if not handle:
+            logger.warning("CreateDC with the driver settings failed - using plain settings")
+            return None
+        logger.info("Printer DC built from driver settings %s", choices)
+        return win32ui.CreateDCFromHandle(handle)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not apply the driver's own settings - using plain settings")
+        return None
+
+
 def spool_to_printer(
     file_path: str,
     printer_name: str,
@@ -503,6 +616,7 @@ def spool_to_printer(
     quality: str = "",
     media_type: str = "",
     doc_name: str = "",
+    opts: Optional[dict] = None,
 ) -> None:
     """
     Send *file_path* to the Windows print queue of *printer_name*.
@@ -556,7 +670,9 @@ def spool_to_printer(
             # Configure DEVMODE to match the target paper size
             # ----------------------------------------------------------
             devmode = None
-            if media_size_mm:
+            opts = opts or {}
+            hdc = _dc_from_driver_features(printer_name, media_size_mm, color_mode, quality, opts)
+            if media_size_mm and hdc is None:
                 try:
                     width_mm, height_mm = media_size_mm
                     props = win32print.GetPrinter(hprinter, 2)
@@ -645,7 +761,7 @@ def spool_to_printer(
             # Colour / monochrome as chosen by the sender (print-color-mode); "auto" or nothing = the driver default
             quality_dm = {"3": -1, "5": -4}.get(str(quality))            # IPP draft -> DMRES_DRAFT, high -> DMRES_HIGH
             media_dm = 3 if "photo" in media_type or "glossy" in media_type else (1 if media_type in ("stationery", "plain") else 0)
-            if color_mode in ("color", "monochrome") or quality_dm or media_dm:
+            if hdc is None and (color_mode in ("color", "monochrome") or quality_dm or media_dm):
                 try:
                     if devmode is None:
                         devmode = win32print.GetPrinter(hprinter, 2)["pDevMode"]
@@ -667,8 +783,7 @@ def spool_to_printer(
             # ----------------------------------------------------------
             # Create the printer DC (using win32gui.CreateDC with devmode)
             # ----------------------------------------------------------
-            hdc = None
-            if devmode is not None:
+            if hdc is None and devmode is not None:
                 try:
                     hdc_handle = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
                     if hdc_handle:
@@ -693,15 +808,52 @@ def spool_to_printer(
             n_copies = max(1, min(int(copies or 1), 99))
             if n_copies > 1:
                 logger.info("Printing %d copies", n_copies)
+            pages = _select_pages(len(pdf_doc), opts.get("page_ranges", ""))
+            n_up = int(opts.get("number_up") or 1)
+            if n_up not in (1, 2, 4, 6, 9, 16):
+                n_up = 1
+            if opts.get("reverse"):
+                pages = pages[::-1]
+            sheets = [pages[i:i + n_up] for i in range(0, len(pages), n_up)]
+            if opts.get("uncollated") and n_copies > 1:            # 1,1,1,2,2,2 instead of 1,2,1,2
+                sheets = [sh for sh in sheets for _ in range(n_copies)]
+                n_copies = 1
+            scaling = opts.get("scaling") or "auto"
+            if opts.get("borderless") and scaling == "auto":
+                scaling = "fill"                                   # borderless: cover the whole sheet
+            if len(pages) != len(pdf_doc) or n_up > 1 or scaling != "auto":
+                logger.info("Pages %s, %d per sheet, scaling=%s", "all" if len(pages) == len(pdf_doc) else
+                            f"{len(pages)} of {len(pdf_doc)}", n_up, scaling)
             for _copy in range(n_copies):
-                for page_num in range(len(pdf_doc)):
-                    logger.info("Rendering page %d/%d...", page_num + 1, len(pdf_doc))
+                for sheet_no, sheet in enumerate(sheets):
+                    logger.info("Rendering sheet %d/%d...", sheet_no + 1, len(sheets))
                     hdc.StartPage()
-
-                    page = pdf_doc.load_page(page_num)
 
                     printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
                     printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
+                    dpi_scale_x = printer_dpi_x / 72.0
+                    dpi_scale_y = printer_dpi_y / 72.0
+
+                    if len(sheet) > 1:
+                        # several pages on one sheet: render each into its cell of a grid
+                        first_rect = pdf_doc.load_page(sheet[0]).rect
+                        cols, rows = _best_grid(len(sheet), printable_width, printable_height,
+                                                first_rect.width * dpi_scale_x, first_rect.height * dpi_scale_y)
+                        cell_w, cell_h = printable_width // cols, printable_height // rows
+                        canvas = Image.new("RGB", (printable_width, printable_height), "white")
+                        for k, pno in enumerate(sheet):
+                            pg = pdf_doc.load_page(pno)
+                            fit = min(cell_w * 0.94 / (pg.rect.width * dpi_scale_x),
+                                      cell_h * 0.94 / (pg.rect.height * dpi_scale_y))
+                            pm = pg.get_pixmap(matrix=fitz.Matrix(dpi_scale_x * fit, dpi_scale_y * fit), alpha=False)
+                            tile = Image.frombytes("RGB", [pm.width, pm.height], pm.samples)
+                            cx, cy = (k % cols) * cell_w, (k // cols) * cell_h
+                            canvas.paste(tile, (cx + (cell_w - pm.width) // 2, cy + (cell_h - pm.height) // 2))
+                        ImageWin.Dib(canvas).draw(hdc.GetHandleOutput(), (0, 0, printable_width, printable_height))
+                        hdc.EndPage()
+                        continue
+
+                    page = pdf_doc.load_page(sheet[0])
                     logger.info(
                         "DC imageable area: %d × %d px  (page PDF rect: %.1f × %.1f pts)",
                         printable_width, printable_height,
@@ -712,19 +864,22 @@ def spool_to_printer(
                     # DPI-based scaling: render at native printer DPI
                     # (1 PDF pt = DPI/72 pixels).
                     # --------------------------------------------------
-                    dpi_scale_x = printer_dpi_x / 72.0
-                    dpi_scale_y = printer_dpi_y / 72.0
-
                     rendered_w = page.rect.width * dpi_scale_x
                     rendered_h = page.rect.height * dpi_scale_y
 
                     scale_w = printable_width / rendered_w if rendered_w > 0 else 1.0
                     scale_h = printable_height / rendered_h if rendered_h > 0 else 1.0
 
+                    if scaling == "fit":
+                        fit_scale = min(scale_w, scale_h)
+                    elif scaling == "fill":
+                        fit_scale = max(scale_w, scale_h)
+                    elif scaling == "none":
+                        fit_scale = 1.0
                     # If width matches printable area (within 5%) but height is much smaller
                     # (typical for thermal label printers where the driver form height is smaller
                     # than the actual label stock), DO NOT shrink width to fit height!
-                    if scale_w >= 0.95 and scale_h < 0.7:
+                    elif scale_w >= 0.95 and scale_h < 0.7:
                         logger.warning(
                             "Printer DC height (%d px) is significantly smaller than document height (%d px), "
                             "but width matches (%.1f%%). Preserving 1:1 scale to avoid shrunken label.",
@@ -745,8 +900,12 @@ def spool_to_printer(
 
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-                    x_offset = max(0, (printable_width - pix.width) // 2)
-                    y_offset = max(0, (printable_height - pix.height) // 2)
+                    if scaling in ("fill", "none"):                # may be larger than the sheet: centre, let GDI clip
+                        x_offset = (printable_width - pix.width) // 2
+                        y_offset = (printable_height - pix.height) // 2
+                    else:
+                        x_offset = max(0, (printable_width - pix.width) // 2)
+                        y_offset = max(0, (printable_height - pix.height) // 2)
 
                     dib = ImageWin.Dib(img)
                     dib.draw(
@@ -841,6 +1000,21 @@ def _ipp_collection(name: str, members) -> bytes:
         return out
     return (struct.pack("!B", IPP_TAG_BEG_COLLECTION) + struct.pack("!H", len(name)) + name.encode() + struct.pack("!H", 0)
             + body(members) + struct.pack("!BHH", IPP_TAG_END_COLLECTION, 0, 0))
+
+
+def _encode_resolution_attribute(name: str, x: int, y: int, first: bool = True) -> bytes:
+    return _encode_attribute(0x32, name if first else "", struct.pack("!iiB", x, y, 3))     # 3 = dots per inch
+
+
+def _media_col_sized(w_mm: float, h_mm: float, borderless: bool = False) -> list:
+    m = 0 if borderless else 300                                   # 3 mm printable margin (hundredths of mm)
+    return [("media-bottom-margin", IPP_TAG_INTEGER, struct.pack("!i", m)),
+            ("media-left-margin", IPP_TAG_INTEGER, struct.pack("!i", m)),
+            ("media-right-margin", IPP_TAG_INTEGER, struct.pack("!i", m)),
+            ("media-top-margin", IPP_TAG_INTEGER, struct.pack("!i", m)),
+            ("media-size", IPP_TAG_BEG_COLLECTION, [
+                ("x-dimension", IPP_TAG_INTEGER, struct.pack("!i", int(round(w_mm * 100)))),
+                ("y-dimension", IPP_TAG_INTEGER, struct.pack("!i", int(round(h_mm * 100))))])]
 
 
 def _media_col(media_key: str) -> list:
@@ -1024,6 +1198,7 @@ def extract_ipp_job_attributes(raw: bytes) -> dict[str, str]:
     }
 
     current_member_name = ""
+    last_attr_name = ""
 
     while idx < len(raw):
         tag = raw[idx]
@@ -1057,6 +1232,15 @@ def extract_ipp_job_attributes(raw: bytes) -> dict[str, str]:
         # In IPP collections, member attribute names have tag 0x4A and name_len == 0
         if tag == IPP_TAG_MEMBER_ATTR_NAME:
             current_member_name = attr_value_raw.decode("ascii", errors="replace")
+            continue
+
+        if attr_name:
+            last_attr_name = attr_name
+        if tag == IPP_TAG_RANGE and value_len == 8:                  # e.g. page-ranges (1setOf rangeOfInteger)
+            lo, hi = struct.unpack("!ii", attr_value_raw)
+            key = attr_name or last_attr_name
+            if key:
+                attrs[key] = (attrs.get(key, "") + "," if attr_name == "" and key in attrs else "") + f"{lo}-{hi}"
             continue
 
         # Effective attribute name (regular or collection member)
@@ -1270,15 +1454,53 @@ def _build_printer_attributes(
 
 
     # media-col-supported — iOS 16+ checks for this collection attribute.
+    caps = driver_caps.peek(printer_name)
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-col-supported", "media-size")
-    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-type")
-    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"media-source")
+    for kw in ("media-type", "media-source", "media-bottom-margin", "media-left-margin", "media-right-margin", "media-top-margin"):
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, kw.encode())
     attrs += _ipp_collection("media-col-default", _media_col(unique_media[0]))
     attrs += _ipp_collection("media-col-ready", _media_col(unique_media[0]))
 
-    # Sides (duplex) — we report simplex only for safety
+    # Every size the printer takes, plus a zero-margin (borderless) twin when the driver offers borderless.
+    first = True
+    for m in unique_media[:40]:
+        wh = IPP_MEDIA_SIZES.get(m)
+        if not wh:
+            continue
+        for borderless in ((False, True) if caps and caps.borderless_supported() else (False,)):
+            attrs += _ipp_collection("media-col-database" if first else "", _media_col_sized(wh[0], wh[1], borderless))
+            first = False
+
+    # Media types straight from the driver (plain, glossy, matte, luster, envelope ... whatever this printer has)
+    if caps and caps.media_types():
+        types = caps.media_types()
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-type-supported", types[0]["keyword"])
+        for t in types[1:]:
+            attrs += _encode_additional_value(IPP_TAG_KEYWORD, t["keyword"].encode())
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-type-default", types[0]["keyword"])
+
+    # Sides: two-sided only when the printer really flips the page itself (manual duplex is not offered)
+    sides = list((caps.duplex_options() if caps else {}) or ["one-sided"])
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "sides-default", "one-sided")
-    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "sides-supported", "one-sided")
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "sides-supported", sides[0])
+    for sd in sides[1:]:
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, sd.encode())
+
+    # Paper trays from the driver
+    bins = caps.input_bins() if caps else []
+    if len(bins) > 1:
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-source-supported", bins[0]["keyword"])
+        for b in bins[1:]:
+            attrs += _encode_additional_value(IPP_TAG_KEYWORD, b["keyword"].encode())
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-source-default", bins[0]["keyword"])
+
+    # Output order / collation (done by the bridge)
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "page-delivery-supported", "same-order")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"reverse-order")
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "page-delivery-default", "same-order")
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "sheet-collate-supported", "collated")
+    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"uncollated")
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "sheet-collate-default", "collated")
 
     # Copies
     attrs += _encode_range_attribute("copies-supported", 1, 99)
@@ -1295,6 +1517,23 @@ def _build_printer_attributes(
         "false",
     )
 
+    # Ink / toner levels (only when the printer can be asked over the network - see supplies.py)
+    sup = supplies.get(cfg) if (cfg or {}).get("supplies_ip") else {"items": []}
+    if sup["items"]:
+        its = sup["items"]
+        attrs += _encode_text_attribute(IPP_TAG_NAME, "marker-names", its[0]["name"])
+        for it in its[1:]:
+            attrs += _encode_additional_value(IPP_TAG_NAME, it["name"].encode())
+        attrs += _encode_integer_attribute("marker-levels", int(its[0]["level"]))
+        for it in its[1:]:
+            attrs += _encode_additional_value(IPP_TAG_INTEGER, struct.pack("!i", int(it["level"])))
+        attrs += _encode_text_attribute(IPP_TAG_NAME, "marker-colors", its[0]["color"] or "none")
+        for it in its[1:]:
+            attrs += _encode_additional_value(IPP_TAG_NAME, (it["color"] or "none").encode())
+        attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "marker-types", its[0]["type"] or "ink-cartridge")
+        for it in its[1:]:
+            attrs += _encode_additional_value(IPP_TAG_KEYWORD, (it["type"] or "ink-cartridge").encode())
+
     # Accepting jobs
     attrs += _encode_boolean_attribute("printer-is-accepting-jobs", True)
 
@@ -1309,11 +1548,34 @@ def _build_printer_attributes(
     # Compression
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "compression-supported", "none")
 
-    # Print quality
+    # Print quality (draft / normal / high) - only the levels this driver really has
+    levels = sorted(caps.quality_options()) if caps and caps.quality_options() else [3, 4, 5]
     attrs += _encode_enum_attribute("print-quality-default", 4)  # 4 = normal
-    attrs += _encode_enum_attribute("print-quality-supported", 3)  # draft
-    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", 4))  # normal
-    attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", 5))  # high
+    attrs += _encode_enum_attribute("print-quality-supported", levels[0])
+    for lv in levels[1:]:
+        attrs += _encode_additional_value(IPP_TAG_ENUM, struct.pack("!i", lv))
+
+    # Options the bridge applies itself, whatever the driver: page ranges, pages per sheet, scaling
+    attrs += _encode_boolean_attribute("page-ranges-supported", True)
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-scaling-default", "auto")
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-scaling-supported", "auto")
+    for kw in ("fit", "fill", "none"):
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, kw.encode())
+    attrs += _encode_integer_attribute("number-up-default", 1)
+    attrs += _encode_integer_attribute("number-up-supported", 1)
+    for n in (2, 4, 6, 9, 16):
+        attrs += _encode_additional_value(IPP_TAG_INTEGER, struct.pack("!i", n))
+    res = caps.resolutions() if caps else []
+    if res:
+        attrs += _encode_resolution_attribute("printer-resolution-supported", *res[0])
+        for r in res[1:]:
+            attrs += _encode_resolution_attribute("printer-resolution-supported", *r, first=False)
+        attrs += _encode_resolution_attribute("printer-resolution-default", *res[0])
+    jc = ["copies", "media", "media-col", "print-color-mode", "print-quality", "page-ranges", "number-up", "print-scaling",
+          "sides", "page-delivery", "sheet-collate"]
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "job-creation-attributes-supported", jc[0])
+    for kw in jc[1:]:
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, kw.encode())
 
     # Printer UUID (deterministic from printer name + hostname, RFC 4122 UUID5)
     # MUST strictly match the UUID in the mDNS TXT record so Android BIPS does not reject it.
@@ -1395,6 +1657,8 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
 
     # Silence the default stderr logging — we log to file.
     def log_message(self, fmt: str, *args: object) -> None:  # noqa: D401
+        if str(args[0] if args else "").startswith("GET /api/"):
+            return                       # the web page polls every few seconds - keep the log readable
         logger.info("HTTP  %s  %s", self.address_string(), fmt % args)
 
     # Support HTTP/1.1 so that we can handle Expect: 100-continue and Chunked transfer
@@ -1436,6 +1700,9 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/eSCL"):
             self._handle_escl("POST", raw)
+            return
+        if webui.is_ui_path(self.path):
+            webui.handle(self, "POST", raw)
             return
         if self.path.startswith("/WebServices/") and self.wsd is not None:
             code, ctype, out, hdrs = self.wsd.handle(self.path, raw, self.headers.get("Content-Type", ""))
@@ -1479,11 +1746,15 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
     def do_GET(self) -> None:  # noqa: N802
         self._route()
-        logger.info(
-            "GET %s  from %s", self.path, self.client_address[0]
-        )
+        if not self.path.startswith("/api/"):
+            logger.info(
+                "GET %s  from %s", self.path, self.client_address[0]
+            )
         if self.path.startswith("/eSCL"):
             self._handle_escl("GET", b"")
+            return
+        if webui.is_ui_path(self.path):
+            webui.handle(self, "GET")
             return
         # Return a simple human-readable status page.
         safe_name = html.escape(self.printer_name)
@@ -1562,7 +1833,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         """Extract the document payload and spool it."""
         # ---- Parse IPP job attributes (media, copies, etc.) ----
         job_attrs_parsed = extract_ipp_job_attributes(raw)
-        media_keyword = job_attrs_parsed.get("media", "")
+        media_keyword = re.sub(r"[._-]borderless$", "", job_attrs_parsed.get("media", ""), flags=re.I)
         media_size_mm: Optional[Tuple[float, float]] = None
         if media_keyword:
             media_size_mm = IPP_MEDIA_SIZES.get(media_keyword)
@@ -1788,7 +2059,7 @@ def _run_ipp_job(jid: int, printer_name: str, tmp_path: str, ext: str, media_siz
             spool_path, printer_name, media_size_mm=media_size_mm,
             color_mode=attrs.get("print-color-mode", ""), copies=copies,
             quality=attrs.get("print-quality", ""), media_type=attrs.get("media-type", ""),
-            doc_name=doc_name,
+            doc_name=doc_name, opts=job_options(attrs),
         )
         result = job_tracking.wait_spooler_job(JOBS, jid, printer_name, doc_name)
         logger.info("Job %d finished: %s", jid, result)
@@ -2069,6 +2340,8 @@ def main(shutdown_event: threading.Event) -> None:
         logger.critical("No usable printer (config.json or Windows default) — aborting.")
         sys.exit(1)
     IPPRequestHandler.host_ip = host_ip
+    webui.attach(sys.modules[__name__])                                 # admin PIN + page
+    driver_caps.load_in_background([c["printer"] for c in cfgs])      # media types, borderless ... from each driver
 
     contexts: dict = {}
     mdns_list = []
@@ -2098,7 +2371,8 @@ def main(shutdown_event: threading.Event) -> None:
                 ctx.escl = escl_scanner.EsclScanner(
                     wia_name, get_display_name(printer_name, cfg),
                     str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
-                    adf=cfg.get("adf"), quality=int(cfg.get("scan_quality") or 85))
+                    adf=cfg.get("adf"), quality=int(cfg.get("scan_quality") or 85),
+                    max_dpi=int(cfg.get("scan_max_dpi") or 1200))
                 logger.info("Scanner sharing enabled for WIA device: %s", wia_name)
 
         mdns = MDNSAdvertiser(printer_name, pip, IPP_PORT, scanner=ctx.escl is not None, cfg=cfg, path_prefix=prefix)

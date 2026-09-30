@@ -48,7 +48,7 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def parse_scan_settings(xml_bytes: bytes) -> Dict[str, object]:
+def parse_scan_settings(xml_bytes: bytes, resolutions=RESOLUTIONS) -> Dict[str, object]:
     """Pull the few eSCL ScanSettings we honour out of the request XML."""
     s: Dict[str, object] = {
         "dpi": 300, "color": True, "format": "image/jpeg",
@@ -66,12 +66,14 @@ def parse_scan_settings(xml_bytes: bytes) -> Dict[str, object]:
             continue
         try:
             if name == "XResolution":
-                s["dpi"] = min(RESOLUTIONS, key=lambda r: abs(r - int(text)))
+                s["dpi"] = min(resolutions, key=lambda r: abs(r - int(text)))
             elif name == "ColorMode":
                 s["color"] = text.upper().startswith("RGB")
             elif name in ("DocumentFormat", "DocumentFormatExt"):
                 if text in ("application/pdf", "image/jpeg"):
                     s["format"] = text
+            elif name == "Duplex":
+                s["duplex"] = text.lower() == "true"
             elif name == "InputSource":
                 s["source"] = "feeder" if text.lower().startswith(("feeder", "adf")) else "platen"
             elif name in ("Width", "Height", "XOffset", "YOffset"):
@@ -87,7 +89,11 @@ def parse_scan_settings(xml_bytes: bytes) -> Dict[str, object]:
 class EsclScanner:
     """eSCL front-end for one WIA scanner."""
 
-    def __init__(self, wia_name: str, display_name: str, uuid_str: str, adf=None, quality: int = 85) -> None:
+    def __init__(self, wia_name: str, display_name: str, uuid_str: str, adf=None, quality: int = 85,
+                 max_dpi: int = 1200) -> None:
+        self.max_dpi = int(max_dpi or 1200)      # "scan_max_dpi" in config: highest resolution offered
+        self._res_list = None
+        self._duplex = None
         self.quality = max(30, min(int(quality or 85), 100))          # JPEG quality of scans ("scan_quality" in config)
         self.wia_name = wia_name
         self._adf = adf                  # True/False from config "adf", None = ask the scanner driver
@@ -95,6 +101,51 @@ class EsclScanner:
         self.uuid = uuid_str
         self.jobs: Dict[str, dict] = {}
         self._jobs_lock = threading.Lock()
+
+    def _probe(self) -> None:
+        """Ask the scanner driver once for its resolutions and whether the feeder does two-sided scans."""
+        with _ADF_LOCK:
+            if self._res_list is not None:
+                return
+            res, duplex = list(RESOLUTIONS), False
+            try:
+                import pythoncom
+                import win32com.client
+                pythoncom.CoInitialize()
+                try:
+                    dm = win32com.client.Dispatch("WIA.DeviceManager")
+                    for info in dm.DeviceInfos:
+                        if info.Type == WIA_TYPE_SCANNER and info.Properties("Name").Value == self.wia_name:
+                            dev = info.Connect()
+                            duplex = bool(int(dev.Properties("Document Handling Capabilities").Value) & 4)
+                            prop = dev.Items.Item(1).Properties("Horizontal Resolution")
+                            vals = []
+                            if prop.SubType == 2:                                  # list of values
+                                vals = [int(v) for v in prop.SubTypeValues]
+                            elif prop.SubType == 1:                                # range: min..max step
+                                lo, hi, st = int(prop.SubTypeMin), int(prop.SubTypeMax), max(1, int(prop.SubTypeStep))
+                                vals = [r for r in (50, 75, 100, 150, 200, 300, 400, 600, 800, 1200, 2400, 4800, 9600)
+                                        if lo <= r <= hi and (r - lo) % st == 0]
+                            vals = sorted({v for v in vals if 50 <= v <= self.max_dpi})
+                            if len(vals) >= 2:
+                                res = vals
+                            break
+                finally:
+                    pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                logger.exception("could not read scanner resolutions - using defaults")
+                self._res_list, self._duplex = res, duplex
+                return
+            self._res_list, self._duplex = res, duplex
+            logger.info("Scanner %r: resolutions %s, feeder duplex %s", self.wia_name, res, duplex)
+
+    def resolutions(self) -> list:
+        self._probe()
+        return list(self._res_list or RESOLUTIONS)
+
+    def has_duplex(self) -> bool:
+        self._probe()
+        return bool(self._duplex) and self.has_adf()
 
     def has_adf(self) -> bool:
         """Does this scanner have an automatic document feeder?  config "adf" wins; otherwise ask WIA once
@@ -129,7 +180,7 @@ class EsclScanner:
         res = "".join(
             f"<scan:DiscreteResolution><scan:XResolution>{r}</scan:XResolution>"
             f"<scan:YResolution>{r}</scan:YResolution></scan:DiscreteResolution>"
-            for r in RESOLUTIONS)
+            for r in self.resolutions())
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScannerCapabilities xmlns:pwg="{NS_PWG}" xmlns:scan="{NS_SCAN}">
  <pwg:Version>2.0</pwg:Version>
@@ -194,6 +245,11 @@ class EsclScanner:
   </scan:AdfSimplexInputCaps>
  </scan:Adf>
 </scan:ScannerCapabilities>"""
+        if self.has_adf() and self.has_duplex():
+            a = xml.index("  <scan:AdfSimplexInputCaps>"); b = xml.index("  </scan:AdfSimplexInputCaps>") + len("  </scan:AdfSimplexInputCaps>")
+            block = xml[a:b]
+            xml = xml[:b] + "\n" + block.replace("AdfSimplexInputCaps", "AdfDuplexInputCaps") + xml[b:]
+            xml = xml.replace("</scan:AdfDuplexInputCaps>\n </scan:Adf>", "</scan:AdfDuplexInputCaps>\n  <scan:AdfOptions><scan:AdfOption>DetectPaperLoaded</scan:AdfOption></scan:AdfOptions>\n </scan:Adf>")
         if not self.has_adf() and "<scan:Adf>" in xml:
             a = xml.index(" <scan:Adf>"); b = xml.index(" </scan:Adf>") + len(" </scan:Adf>")
             xml = xml[:a] + xml[b:].lstrip("\n")
@@ -212,7 +268,7 @@ class EsclScanner:
     # Jobs                                                                #
     # ------------------------------------------------------------------ #
     def create_job(self, settings_xml: bytes) -> str:
-        return self.create_job_settings(parse_scan_settings(settings_xml))
+        return self.create_job_settings(parse_scan_settings(settings_xml, self.resolutions()))
 
     def create_job_settings(self, settings: Dict[str, object]) -> str:
         job_id = str(uuid.uuid4())
@@ -395,7 +451,7 @@ class EsclScanner:
                     break
             if dev is None:
                 raise RuntimeError(f"WIA scanner '{self.wia_name}' not found")
-            for name, value in (("Document Handling Select", 1),):     # 1 = feeder; sheet by sheet until the tray is empty
+            for name, value in (("Document Handling Select", 5 if (settings.get("duplex") and self.has_duplex()) else 1),):     # 1 = feeder (+4 = both sides); sheet by sheet until the tray is empty
                 try:
                     dev.Properties(name).Value = value
                 except Exception as exc:  # noqa: BLE001

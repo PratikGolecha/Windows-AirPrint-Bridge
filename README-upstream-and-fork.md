@@ -169,4 +169,18 @@ Details and pitfalls: notes-folder GOTCHAS #45.
 `printer` (Windows queue name), `display_name`, `scanner` (WIA name), `default_paper`, `ip` (own address), `color` (true/false, else detected),
 `location`, `model`, `ppm`, `media` (list of IPP names, else the printer's own forms), `adf` (true/false, else detected), `scan_quality` (JPEG, default 85),
 `wsd`, `wsd_model`, `wsd_maker`, `wsd_uuid`, `wsd_url`, `wsd_firmware`.  Top level: `port` (IPP/eSCL port, default 631), `wsd_port`, and the `printers` list.
-Files that must be deployed together: `airprint_bridge.py`, `escl_scanner.py`, `wsd_device.py`, `job_tracking.py`.
+Files that must be deployed together: `airprint_bridge.py`, `escl_scanner.py`, `wsd_device.py`, `job_tracking.py`, `driver_caps.py`, `webui.py`, `supplies.py`, `maintenance.py`.
+
+## Web page, driver features, maintenance (phase 1)
+
+* **Web page** at `http://<printer ip>:631/` (status, jobs, test print, scanner test, maintenance, settings, log). Actions, the log and the
+  settings need the admin PIN: a random 6-digit `admin_pin` is written to `config.json` on first start (never logged).
+* **Driver features** (`driver_caps.py`): media types, borderless, quality, resolutions, two-sided (only real automatic duplex), trays are read from
+  the printer's Windows Print Schema and applied per job through a PrintTicket. Page ranges, pages per sheet, scaling, reverse order and
+  uncollated copies are done by the bridge itself.
+* **Maintenance** (`maintenance.py`): commands are discovered from the printer's own driver files (Canon CX-generation inkjets: nozzle check, cleaning,
+  roller cleaning ...). Risky ones are hidden unless `"maintenance_advanced": true`. Any brand: record a function with `learn-maintenance` (RAW-queue
+  drivers only). Newer Canon drivers that bypass the queue (Assistant Tool generation) are not supported.
+* **Config keys added:** `scan_max_dpi` (default 1200), `supplies_ip` / `supplies_path` (read ink/toner over IPP from the printer's network side),
+  `network_printers` (`[{"name":..,"ip":..}]` read-only cards), `maintenance_advanced`, `admin_pin`.
+* Files to deploy together: `airprint_bridge.py`, `escl_scanner.py`, `wsd_device.py`, `job_tracking.py`, `driver_caps.py`, `webui.py`, `supplies.py`, `maintenance.py`.

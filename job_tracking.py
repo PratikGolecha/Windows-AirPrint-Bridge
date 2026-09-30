@@ -11,6 +11,7 @@ The bridge hands every document to the Windows print spooler.  This module lets 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Callable, Dict, List, Optional
@@ -83,11 +84,40 @@ def printer_status(printer_name: str, max_age: float = 3.0) -> dict:
 class JobTracker:
     """IPP job ids and states, kept in memory (the last ``keep`` jobs)."""
 
-    def __init__(self, keep: int = 200) -> None:
+    def __init__(self, keep: int = 200, path: Optional[str] = None) -> None:
         self._jobs: Dict[int, dict] = {}
         self._lock = threading.Lock()
         self._next = 1
         self._keep = keep
+        self._path = path                       # jobs.json: history survives a restart
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path:
+            return
+        try:
+            import json
+            with open(self._path, encoding="utf-8") as fh:
+                for j in json.load(fh):
+                    j["cancel"] = threading.Event()
+                    if j["state"] < JOB_CANCELED:             # it was running when the bridge stopped
+                        j["state"], j["reasons"], j["finished"] = JOB_ABORTED, ["aborted-by-system"], time.time()
+                    self._jobs[j["id"]] = j
+                    self._next = max(self._next, j["id"] + 1)
+        except (OSError, ValueError, KeyError):
+            pass
+
+    def _save(self) -> None:
+        if not self._path:
+            return
+        try:
+            import json
+            keep = [{k: v for k, v in j.items() if k != "cancel"} for j in list(self._jobs.values())]
+            with open(self._path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(keep, fh)
+            os.replace(self._path + ".tmp", self._path)
+        except (OSError, RuntimeError, TypeError):
+            pass
 
     def create(self, printer: str, name: str = "", user: str = "") -> int:
         with self._lock:
@@ -98,6 +128,7 @@ class JobTracker:
                                "cancel": threading.Event(), "spool_id": None}
             for old in sorted(self._jobs)[:-self._keep]:
                 self._jobs.pop(old, None)
+        self._save()
         return jid
 
     def get(self, jid: int) -> Optional[dict]:
@@ -111,6 +142,7 @@ class JobTracker:
         job["reasons"] = reasons or ["none"]
         if state >= JOB_CANCELED and not job["finished"]:
             job["finished"] = time.time()
+        self._save()
 
     def list(self, printer: str, completed: Optional[bool] = None) -> List[dict]:
         with self._lock:
