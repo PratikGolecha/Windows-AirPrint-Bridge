@@ -1921,7 +1921,8 @@ def main(shutdown_event: threading.Event) -> None:
             else:
                 ctx.escl = escl_scanner.EsclScanner(
                     wia_name, get_display_name(printer_name, cfg),
-                    str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")))
+                    str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
+                    adf=cfg.get("adf"))
                 logger.info("Scanner sharing enabled for WIA device: %s", wia_name)
 
         mdns = MDNSAdvertiser(printer_name, host_ip, IPP_PORT, scanner=ctx.escl is not None, cfg=cfg, path_prefix=prefix)

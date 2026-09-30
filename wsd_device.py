@@ -356,6 +356,13 @@ class WsdDevice:
         res_w = "".join(f"<wscn:Width>{r}</wscn:Width>" for r in SCAN_RESOLUTIONS)
         res_h = "".join(f"<wscn:Height>{r}</wscn:Height>" for r in SCAN_RESOLUTIONS)
         color = "<wscn:ColorEntry>Grayscale8</wscn:ColorEntry><wscn:ColorEntry>RGB24</wscn:ColorEntry>"
+        adf_xml = f"""<wscn:ADF><wscn:ADFSupportsDuplex>0</wscn:ADFSupportsDuplex><wscn:ADFFront>
+<wscn:ADFOpticalResolution><wscn:Width>600</wscn:Width><wscn:Height>600</wscn:Height></wscn:ADFOpticalResolution>
+<wscn:ADFResolutions><wscn:Widths>{res_w}</wscn:Widths><wscn:Heights>{res_h}</wscn:Heights></wscn:ADFResolutions>
+<wscn:ADFColor>{color}</wscn:ADFColor>
+<wscn:ADFMinimumSize><wscn:Width>556</wscn:Width><wscn:Height>556</wscn:Height></wscn:ADFMinimumSize>
+<wscn:ADFMaximumSize><wscn:Width>{SCAN_MAX_W}</wscn:Width><wscn:Height>{SCAN_MAX_H}</wscn:Height></wscn:ADFMaximumSize>
+</wscn:ADFFront></wscn:ADF>""" if self.scanner.has_adf() else ""
         return f"""<wscn:GetScannerElementsResponse><wscn:ScannerElements>
 <wscn:ElementData Name="wscn:ScannerDescription" Valid="true"><wscn:ScannerDescription><wscn:ScannerName xml:lang="en-US">{sname}</wscn:ScannerName></wscn:ScannerDescription></wscn:ElementData>
 <wscn:ElementData Name="wscn:ScannerConfiguration" Valid="true"><wscn:ScannerConfiguration>
@@ -377,13 +384,7 @@ class WsdDevice:
 <wscn:PlatenMinimumSize><wscn:Width>556</wscn:Width><wscn:Height>556</wscn:Height></wscn:PlatenMinimumSize>
 <wscn:PlatenMaximumSize><wscn:Width>{SCAN_MAX_W}</wscn:Width><wscn:Height>{SCAN_MAX_H}</wscn:Height></wscn:PlatenMaximumSize>
 </wscn:Platen>
-<wscn:ADF><wscn:ADFSupportsDuplex>0</wscn:ADFSupportsDuplex><wscn:ADFFront>
-<wscn:ADFOpticalResolution><wscn:Width>600</wscn:Width><wscn:Height>600</wscn:Height></wscn:ADFOpticalResolution>
-<wscn:ADFResolutions><wscn:Widths>{res_w}</wscn:Widths><wscn:Heights>{res_h}</wscn:Heights></wscn:ADFResolutions>
-<wscn:ADFColor>{color}</wscn:ADFColor>
-<wscn:ADFMinimumSize><wscn:Width>556</wscn:Width><wscn:Height>556</wscn:Height></wscn:ADFMinimumSize>
-<wscn:ADFMaximumSize><wscn:Width>{SCAN_MAX_W}</wscn:Width><wscn:Height>{SCAN_MAX_H}</wscn:Height></wscn:ADFMaximumSize>
-</wscn:ADFFront></wscn:ADF>
+{adf_xml}
 </wscn:ScannerConfiguration></wscn:ElementData>
 <wscn:ElementData Name="wscn:ScannerStatus" Valid="true"><wscn:ScannerStatus><wscn:ScannerCurrentTime>{time.strftime('%Y-%m-%dT%H:%M:%S')}</wscn:ScannerCurrentTime><wscn:ScannerState>Idle</wscn:ScannerState><wscn:ActiveConditions/></wscn:ScannerStatus></wscn:ElementData>
 <wscn:ElementData Name="wscn:DefaultScanTicket" Valid="true"><wscn:DefaultScanTicket>

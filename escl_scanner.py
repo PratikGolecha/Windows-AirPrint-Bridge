@@ -86,12 +86,38 @@ def parse_scan_settings(xml_bytes: bytes) -> Dict[str, object]:
 class EsclScanner:
     """eSCL front-end for one WIA scanner."""
 
-    def __init__(self, wia_name: str, display_name: str, uuid_str: str) -> None:
+    def __init__(self, wia_name: str, display_name: str, uuid_str: str, adf=None) -> None:
         self.wia_name = wia_name
+        self._adf = adf                  # True/False from config "adf", None = ask the scanner driver
         self.display_name = display_name
         self.uuid = uuid_str
         self.jobs: Dict[str, dict] = {}
         self._jobs_lock = threading.Lock()
+
+    def has_adf(self) -> bool:
+        """Does this scanner have an automatic document feeder?  config "adf" wins; otherwise ask WIA once
+        (Document Handling Capabilities bit 1 = feeder) and remember the answer."""
+        if self._adf is None:
+            try:
+                import pythoncom
+                import win32com.client
+                pythoncom.CoInitialize()
+                try:
+                    dm = win32com.client.Dispatch("WIA.DeviceManager")
+                    for info in dm.DeviceInfos:
+                        if info.Type == WIA_TYPE_SCANNER and info.Properties("Name").Value == self.wia_name:
+                            caps = int(info.Connect().Properties("Document Handling Capabilities").Value)
+                            self._adf = bool(caps & 1)
+                            logger.info("Scanner %r: feeder %s (WIA capabilities %d)", self.wia_name,
+                                        "present" if self._adf else "absent", caps)
+                            break
+                finally:
+                    pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                logger.exception("could not read the scanner's feeder capability - assuming none")
+            if self._adf is None:
+                return False               # not cached: try again next time
+        return bool(self._adf)
 
     # ------------------------------------------------------------------ #
     # XML documents                                                       #
@@ -165,6 +191,9 @@ class EsclScanner:
   </scan:AdfSimplexInputCaps>
  </scan:Adf>
 </scan:ScannerCapabilities>"""
+        if not self.has_adf() and "<scan:Adf>" in xml:
+            a = xml.index(" <scan:Adf>"); b = xml.index(" </scan:Adf>") + len(" </scan:Adf>")
+            xml = xml[:a] + xml[b:].lstrip("\n")
         return xml.encode("utf-8")
 
     def status_xml(self) -> bytes:
@@ -217,6 +246,8 @@ class EsclScanner:
                         job["docs"].append((jpeg, "image/jpeg"))
 
                 src = job["settings"].get("source")
+                if src == "auto" and not self.has_adf():
+                    src = "platen"
                 if src in ("feeder", "auto"):
                     try:
                         self._wia_scan_feeder(job["settings"], add_page)
