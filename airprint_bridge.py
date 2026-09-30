@@ -56,6 +56,7 @@ except ImportError:                    # spool_to_printer reports a clear error 
 
 import job_tracking
 import webui                       # web admin page + JSON API (webui.py)
+import icons                       # drawn printer pictures for phones (icons.py)
 import maintenance                 # nozzle check / cleaning ... as RAW jobs (maintenance.py)
 import supplies                    # ink/toner levels from the printer's network side (supplies.py)
 import driver_caps                 # what the printer's own driver can do (media types, borderless, quality ...)
@@ -546,7 +547,22 @@ def _best_grid(n: int, sheet_w: float, sheet_h: float, page_w: float, page_h: fl
 def job_options(attrs: dict) -> dict:
     """The per-job choices the bridge applies itself or hands to the driver, from the parsed IPP attributes."""
     margins = [attrs.get(k) for k in ("media-top-margin", "media-bottom-margin", "media-left-margin", "media-right-margin")]
-    borderless = all(m == "0" for m in margins) or "borderless" in str(attrs.get("media", "")).lower()
+    named = "borderless" in str(attrs.get("media", "")).lower()          # the sender picked a paper size called "... borderless": always honoured
+    borderless = named or all(m == "0" for m in margins)
+    if borderless and not named and attrs.get("x-client-mobile") == "1":
+        # a phone that merely sent zero margins: only photo-size paper (phones have no borderless switch; they'd get it by accident)
+        dims = None
+        if attrs.get("x-dimension") and attrs.get("y-dimension"):
+            try:
+                dims = (int(attrs["x-dimension"]) / 100.0, int(attrs["y-dimension"]) / 100.0)
+            except ValueError:
+                dims = None
+        if dims is None:
+            kw = re.sub(r"[._-]borderless$", "", str(attrs.get("media", "")), flags=re.I)
+            dims = IPP_MEDIA_SIZES.get(kw) or size_from_keyword(kw)
+        if dims and not is_photo_size(*dims):
+            logger.info("Zero margins requested for a %.0f x %.0f mm sheet - printing normally (borderless is only for photo sizes)", *dims)
+            borderless = False
     try:
         number_up = int(attrs.get("number-up", "1") or 1)
     except ValueError:
@@ -1297,6 +1313,29 @@ _FALLBACK_MEDIA = ["iso_a4_210x297mm", "na_letter_8.5x11in", "iso_a5_148x210mm",
                    "iso_a8_52x74mm", "na_legal_8.5x14in", "na_index-4x6_4x6in", "om_small-photo_100x150mm"]
 
 
+def _icon_kind_flags(printer_name: str, cfg: Optional[dict], has_scanner: bool) -> tuple:
+    caps = driver_caps.peek(printer_name)
+    is_label = bool(caps and any(b["keyword"] in ("continuous-roll", "roll") for b in caps.input_bins()))
+    return icons.kind_for(cfg, has_scanner, printer_is_color(printer_name, cfg), is_label)
+
+
+def is_mobile_client(user_agent: str) -> bool:
+    """Phones/tablets (Android print service, Mopria, iOS ...) can't pick borderless as an option, so they must not be handed
+    zero-margin variants of ordinary paper; Macs and Windows PCs can (and ask for it explicitly)."""
+    ua = (user_agent or "").lower()
+    return any(k in ua for k in ("android", "iphone", "ipad", "ios", "mopria", "wprint"))
+
+
+A4_BORDERLESS = "iso_a4-borderless_210x297mm"          # "A4 borderless" offered to phones as a paper size of its own
+
+
+def is_photo_size(w_mm: float, h_mm: float) -> bool:
+    """Borderless is only offered/used for photo-type paper (up to A5 / 5x7 in and around).  Offering a zero-margin A4 made phones
+    pick it by default, and the bridge then enlarged ordinary PDFs to fill the page instead of printing them at actual size."""
+    short, long_ = sorted((w_mm, h_mm))
+    return short <= 130.0 and long_ <= 210.5
+
+
 def size_from_keyword(keyword: str) -> Optional[Tuple[float, float]]:
     """(width, height) in mm from a PWG self-describing media name such as om_100x100mm_100x100mm or na_index-4x6_4x6in;
     None if the name does not end in <W>x<H>mm|in.  Lets any label size work without a table entry."""
@@ -1357,6 +1396,7 @@ def _build_printer_attributes(
     host_ip: str,
     cfg: Optional[dict] = None,
     url_prefix: str = "",
+    mobile: bool = False,
 ) -> bytes:
     """
     Return the pre-encoded *printer-attributes* group that iOS / Android
@@ -1473,9 +1513,14 @@ def _build_printer_attributes(
             seen_media.add(m)
             unique_media.append(m)
 
+    supported_list = list(unique_media)
+    if mobile and driver_caps.peek(printer_name) and driver_caps.peek(printer_name).borderless_supported() \
+            and "iso_a4_210x297mm" in unique_media and A4_BORDERLESS not in supported_list:
+        IPP_MEDIA_SIZES[A4_BORDERLESS] = (210.0, 297.0)
+        supported_list.insert(supported_list.index("iso_a4_210x297mm") + 1, A4_BORDERLESS)      # phones have no borderless switch
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-default", unique_media[0])
-    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-supported", unique_media[0])
-    for m in unique_media[1:]:
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "media-supported", supported_list[0])
+    for m in supported_list[1:]:
         attrs += _encode_additional_value(IPP_TAG_KEYWORD, m.encode("ascii"))
 
     # media-ready — iOS 16+ requires this to show the printer.
@@ -1498,7 +1543,9 @@ def _build_printer_attributes(
         wh = IPP_MEDIA_SIZES.get(m)
         if not wh:
             continue
-        for borderless in ((False, True) if caps and caps.borderless_supported() else (False,)):
+        # zero-margin (borderless) twin: photo sizes for everybody; every other size (A4 ...) only for Macs/PCs, never phones
+        twin = bool(caps and caps.borderless_supported() and (is_photo_size(*wh) or not mobile))
+        for borderless in ((False, True) if twin else (False,)):
             attrs += _ipp_collection("media-col-database" if first else "", _media_col_sized(wh[0], wh[1], borderless))
             first = False
 
@@ -1620,6 +1667,13 @@ def _build_printer_attributes(
         IPP_TAG_URI, "printer-more-info",
         f"http://{host_ip}:{IPP_PORT}/",
     )
+
+    # Printer pictures (PNG 48/128/512) - phones show them on the printer's page
+    pid = _slug(display_name)
+    icon_uris = [f"http://{host_ip}:{IPP_PORT}{url_prefix}/icons/{pid}-{sz}.png" for sz in (48, 128, 512)]
+    attrs += _encode_text_attribute(IPP_TAG_URI, "printer-icons", icon_uris[0])
+    for u in icon_uris[1:]:
+        attrs += _encode_additional_value(IPP_TAG_URI, u.encode())
 
     # URF (Apple Raster) capabilities - iOS requires this attribute.  Built from what the printer really is:
     # W8 = grayscale, SRGB24 = colour (only if the printer is colour), RSx-y = resolutions, DM1 = two-sided (only if it duplexes).
@@ -1780,6 +1834,21 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/eSCL"):
             self._handle_escl("GET", b"")
             return
+        if self.path.startswith("/icons/"):
+            m = re.match(r"^/icons/(.+)-(48|128|512)\.png$", self.path)
+            ctx = self.contexts.get(m.group(1)) if m else None
+            ctx = ctx or self.ctx
+            if not m or ctx is None:
+                self._send_plain(404, b"")
+                return
+            size, data = int(m.group(2)), None
+            if ctx.cfg.get("icon_file"):
+                data = icons.file_icon(str(ctx.cfg["icon_file"]), size)
+            if data is None:
+                data = icons.make_icon(_icon_kind_flags(ctx.printer_name, ctx.cfg, ctx.escl is not None), size,
+                                       scanner=ctx.escl is not None, color=printer_is_color(ctx.printer_name, ctx.cfg))
+            self._send_plain(200, data, "image/png", {"Cache-Control": "max-age=3600"})
+            return
         if webui.is_ui_path(self.path):
             webui.handle(self, "GET")
             return
@@ -1860,6 +1929,8 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         """Extract the document payload and spool it."""
         # ---- Parse IPP job attributes (media, copies, etc.) ----
         job_attrs_parsed = extract_ipp_job_attributes(raw)
+        if is_mobile_client(self.headers.get("User-Agent", "")):
+            job_attrs_parsed["x-client-mobile"] = "1"
         media_keyword = re.sub(r"[._-]borderless$", "", job_attrs_parsed.get("media", ""), flags=re.I)
         media_size_mm: Optional[Tuple[float, float]] = None
         if media_keyword:
@@ -1964,7 +2035,8 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         self, req_id: int, ver_maj: int, ver_min: int,
     ) -> None:
         """Return a rich set of printer attributes for discovery."""
-        attrs = _build_printer_attributes(self.printer_name, self.ctx.ip or self.host_ip, self.ctx.cfg, self.url_prefix)
+        attrs = _build_printer_attributes(self.printer_name, self.ctx.ip or self.host_ip, self.ctx.cfg, self.url_prefix,
+                                          mobile=is_mobile_client(self.headers.get("User-Agent", "")))
         response = build_ipp_response(
             req_id, IPP_STATUS_OK, extra_groups=attrs,
             version_major=ver_maj, version_minor=ver_min,
