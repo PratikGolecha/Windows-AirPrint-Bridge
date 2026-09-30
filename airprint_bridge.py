@@ -476,6 +476,23 @@ def printer_is_color(printer_name: str, cfg: Optional[dict] = None) -> bool:
         return True
 
 
+def printer_traits(printer_name: str, cfg: Optional[dict] = None) -> dict:
+    """What this printer really is, for every place the bridge announces it (IPP, mDNS, Windows WSD):
+    {'color': bool, 'duplex': bool, 'urf': 'AirPrint raster string'}.  Colour comes from the driver (or config "color"),
+    two-sided from the driver's automatic-duplex option (or config "duplex"), resolutions from the driver."""
+    color = printer_is_color(printer_name, cfg)
+    caps = driver_caps.peek(printer_name)
+    if cfg is not None and cfg.get("duplex") is not None:
+        duplex = bool(cfg.get("duplex"))
+    else:
+        duplex = bool(caps and caps.duplex_options())
+    res = sorted({max(r) for r in caps.resolutions()}) if caps else []
+    res = [r for r in res if r <= 1200] or [300, 600]
+    rs = f"RS{res[0]}" if len(res) == 1 else f"RS{res[0]}-{res[-1]}"
+    parts = ["V1.4", "W8"] + (["SRGB24"] if color else []) + [rs] + (["DM1"] if duplex else [])
+    return {"color": color, "duplex": duplex, "urf": ",".join(parts)}
+
+
 def get_target_printer() -> str:
     """
     Return the printer to share.
@@ -1590,16 +1607,12 @@ def _build_printer_attributes(
         f"http://{host_ip}:{IPP_PORT}/",
     )
 
-    # URF (Apple Raster) capabilities — iOS requires this attribute.
-    # W8 = max width 8 inches, SRGB24 = 24-bit sRGB, V1.4 = URF version,
-    # RS300-600 = supported resolutions, DM1 = duplex mode 1 (simplex).
-    attrs += _encode_text_attribute(
-        IPP_TAG_KEYWORD, "urf-supported", "W8"
-    )
-    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"SRGB24")
-    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"V1.4")
-    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"RS300-600")
-    attrs += _encode_additional_value(IPP_TAG_KEYWORD, b"DM1")
+    # URF (Apple Raster) capabilities - iOS requires this attribute.  Built from what the printer really is:
+    # W8 = grayscale, SRGB24 = colour (only if the printer is colour), RSx-y = resolutions, DM1 = two-sided (only if it duplexes).
+    urf = printer_traits(printer_name, cfg)["urf"].split(",")
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "urf-supported", urf[0])
+    for u in urf[1:]:
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, u.encode())
 
     # AirPrint-specific: printer-type flags
     # Bit 0 = local, Bit 2 = can print — 0x05 covers the basics
@@ -2202,11 +2215,11 @@ class MDNSAdvertiser:
             "ty": display_name,
             "product": f"({self._printer_name})",
             "pdl": "application/pdf,image/urf,image/jpeg,image/png,image/pwg-raster",
-            "Color": "T" if printer_is_color(self._printer_name, self._cfg) else "F",   # Must match SRGB24 in URF
-            "Duplex": "F",
+            "Color": "T" if printer_traits(self._printer_name, self._cfg)["color"] else "F",   # must match SRGB24 in URF
+            "Duplex": "T" if printer_traits(self._printer_name, self._cfg)["duplex"] else "F",
             "adminurl": f"http://{self._host_ip}:{self._port}/",
             "priority": "50",
-            "URF": "W8,SRGB24,V1.4,RS300-600,DM1",
+            "URF": printer_traits(self._printer_name, self._cfg)["urf"],
             "UUID": printer_uuid_str,
             "TLS": "none",
         }
@@ -2341,6 +2354,12 @@ def main(shutdown_event: threading.Event) -> None:
         sys.exit(1)
     IPPRequestHandler.host_ip = host_ip
     webui.attach(sys.modules[__name__])                                 # admin PIN + page
+    for _c in cfgs:                                                      # first start: read the driver now so the announcements are right
+        if driver_caps.peek(_c["printer"]) is None:
+            try:
+                driver_caps.load(_c["printer"])
+            except Exception:  # noqa: BLE001
+                logger.warning("could not read the driver of %r yet", _c["printer"])
     driver_caps.load_in_background([c["printer"] for c in cfgs])      # media types, borderless ... from each driver
 
     contexts: dict = {}
@@ -2393,7 +2412,8 @@ def main(shutdown_event: threading.Event) -> None:
                 status_fn=(lambda _p=printer_name: job_tracking.printer_status(_p)),
                 ppm=int(cfg.get("ppm") or 10),
                 maker_url=str(cfg.get("wsd_url") or ""),
-                firmware=str(cfg.get("wsd_firmware") or "1"))
+                firmware=str(cfg.get("wsd_firmware") or "1"),
+                traits_fn=(lambda _p=printer_name, _c=cfg: printer_traits(_p, _c)))
             ctx.wsd = dev
             wsd_devs.append(dev)
 

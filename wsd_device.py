@@ -101,8 +101,9 @@ class WsdDevice:
 
     def __init__(self, uuid_str: str, host_ip: str, port: int, display_name: str, maker: str, model: str,
                  scanner=None, print_document: Optional[Callable[[bytes, str], None]] = None,
-                 path_prefix: str = "", status_fn=None, ppm: int = 10, maker_url: str = "", firmware: str = "1") -> None:
+                 path_prefix: str = "", status_fn=None, ppm: int = 10, maker_url: str = "", firmware: str = "1", traits_fn=None) -> None:
         self.status_fn, self.ppm, self.firmware = status_fn, ppm, firmware
+        self.traits_fn = traits_fn          # -> {'color': bool, 'duplex': bool, 'urf': str}; None = colour, one-sided (old behaviour)
         self.maker_url = maker_url or f"http://www.{re.sub(r'[^a-z0-9]', '', maker.lower())}.com"
         self.uuid = uuid_str.lower()
         self.host_ip, self.port = host_ip, port
@@ -412,16 +413,20 @@ class WsdDevice:
         pname = escape(self.display_name)
         if name == "GetPrinterElements":
             pstate, preason, pqueued = self._wsd_status()
-            devid = escape(f"MFG:{self.maker};CMD:URF,PWGRaster;MDL:{self.model_short};CLS:PRINTER;CID:MS_PWGR;URF:SRGB24,W8,CP1,IS1,RS300,V1.4,DM1;")
+            try:
+                tr = self.traits_fn() if self.traits_fn else {"color": True, "duplex": False, "urf": "SRGB24,W8,RS300,V1.4"}
+            except Exception:  # noqa: BLE001
+                tr = {"color": True, "duplex": False, "urf": "SRGB24,W8,RS300,V1.4"}
+            devid = escape(f"MFG:{self.maker};CMD:URF,PWGRaster;MDL:{self.model_short};CLS:PRINTER;CID:MS_PWGR;URF:{tr['urf']},CP1,IS1;")
             body = f"""<wprt:GetPrinterElementsResponse><wprt:PrinterElements>
 <wprt:ElementData Name="wprt:PrinterDescription" Valid="true"><wprt:PrinterDescription>
-<wprt:ColorSupported>1</wprt:ColorSupported><wprt:DeviceId>{devid}</wprt:DeviceId>
+<wprt:ColorSupported>{1 if tr["color"] else 0}</wprt:ColorSupported><wprt:DeviceId>{devid}</wprt:DeviceId>
 <wprt:MultipleDocumentJobsSupported>false</wprt:MultipleDocumentJobsSupported>
-<wprt:PagesPerMinute>{self.ppm}</wprt:PagesPerMinute><wprt:PagesPerMinuteColor>{max(1, self.ppm // 2)}</wprt:PagesPerMinuteColor>
+<wprt:PagesPerMinute>{self.ppm}</wprt:PagesPerMinute><wprt:PagesPerMinuteColor>{max(1, self.ppm // 2) if tr["color"] else 0}</wprt:PagesPerMinuteColor>
 <wprt:PrinterName xml:lang="en-US">{pname}</wprt:PrinterName></wprt:PrinterDescription></wprt:ElementData>
 <wprt:ElementData Name="wprt:PrinterConfiguration" Valid="true"><wprt:PrinterConfiguration><wprt:PrinterEventRate>1</wprt:PrinterEventRate>
 <wprt:Finishings><wprt:CollationSupported>0</wprt:CollationSupported><wprt:JogOffsetSupported>0</wprt:JogOffsetSupported>
-<wprt:DuplexerInstalled>0</wprt:DuplexerInstalled><wprt:StaplerInstalled>0</wprt:StaplerInstalled><wprt:HolePunchInstalled>0</wprt:HolePunchInstalled></wprt:Finishings>
+<wprt:DuplexerInstalled>{1 if tr["duplex"] else 0}</wprt:DuplexerInstalled><wprt:StaplerInstalled>0</wprt:StaplerInstalled><wprt:HolePunchInstalled>0</wprt:HolePunchInstalled></wprt:Finishings>
 </wprt:PrinterConfiguration></wprt:ElementData>
 <wprt:ElementData Name="wprt:PrinterStatus" Valid="true"><wprt:PrinterStatus><wprt:PrinterCurrentTime>{time.strftime('%Y-%m-%dT%H:%M:%S')}</wprt:PrinterCurrentTime>
 <wprt:PrinterState>{pstate}</wprt:PrinterState><wprt:PrinterPrimaryStateReason>{preason}</wprt:PrinterPrimaryStateReason><wprt:QueuedJobCount>{pqueued}</wprt:QueuedJobCount></wprt:PrinterStatus></wprt:ElementData>
