@@ -403,7 +403,7 @@ def get_default_paper(cfg: Optional[dict] = None) -> Optional[Tuple[str, Tuple[f
     if not value:
         return None
     key = _MEDIA_ALIASES.get(value.lower(), value)
-    size = IPP_MEDIA_SIZES.get(key)
+    size = IPP_MEDIA_SIZES.get(key) or size_from_keyword(key)
     if not size:
         logger.warning("config.json default_paper=%r is not a known size - ignoring it", value)
         return None
@@ -1297,11 +1297,25 @@ _FALLBACK_MEDIA = ["iso_a4_210x297mm", "na_letter_8.5x11in", "iso_a5_148x210mm",
                    "iso_a8_52x74mm", "na_legal_8.5x14in", "na_index-4x6_4x6in", "om_small-photo_100x150mm"]
 
 
+def size_from_keyword(keyword: str) -> Optional[Tuple[float, float]]:
+    """(width, height) in mm from a PWG self-describing media name such as om_100x100mm_100x100mm or na_index-4x6_4x6in;
+    None if the name does not end in <W>x<H>mm|in.  Lets any label size work without a table entry."""
+    m = re.search(r"_(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)(mm|in)$", keyword or "")
+    if not m:
+        return None
+    w, h = float(m.group(1)), float(m.group(2))
+    k = 25.4 if m.group(3) == "in" else 1.0
+    return round(w * k, 1), round(h * k, 1)
+
+
 def supported_media(printer_name: str, cfg: Optional[dict], default_media: str) -> list:
     """Paper sizes to advertise: config "media": [...] if given, else the printer's own Windows forms
     (mapped to IPP names, unknown ones as custom_<name>_<w>x<h>mm), else a generic list.  Cached 5 minutes."""
     if cfg and isinstance(cfg.get("media"), list) and cfg["media"]:
         found = [str(m) for m in cfg["media"]]
+        for m in found:                                    # self-describing names (om_100x100mm_100x100mm) need no table entry
+            if m not in IPP_MEDIA_SIZES and size_from_keyword(m):
+                IPP_MEDIA_SIZES[m] = size_from_keyword(m)
     else:
         hit = _media_cache.get(printer_name)
         if hit and time.time() - hit[0] < 300:
@@ -1849,7 +1863,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         media_keyword = re.sub(r"[._-]borderless$", "", job_attrs_parsed.get("media", ""), flags=re.I)
         media_size_mm: Optional[Tuple[float, float]] = None
         if media_keyword:
-            media_size_mm = IPP_MEDIA_SIZES.get(media_keyword)
+            media_size_mm = IPP_MEDIA_SIZES.get(media_keyword) or size_from_keyword(media_keyword)
             if media_size_mm:
                 logger.info(
                     "IPP media='%s' → %.1f × %.1f mm",

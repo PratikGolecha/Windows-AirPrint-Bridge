@@ -207,8 +207,8 @@ def _start_test(ctx, opts: dict) -> int:
     if opts.get("number_up"):
         attrs["number-up"] = str(int(opts["number_up"]))
     size, _ = app.choose_media_size(None, False, ctx.cfg)
-    if opts.get("media") and opts["media"] in app.IPP_MEDIA_SIZES:
-        size = app.IPP_MEDIA_SIZES[opts["media"]]
+    if opts.get("media"):
+        size = app.IPP_MEDIA_SIZES.get(opts["media"]) or app.size_from_keyword(opts["media"]) or size
     copies = max(1, min(int(opts.get("copies") or 1), 20))
     path = _test_pdf(ctx, {k: v for k, v in opts.items() if k in ("media", "media_type", "quality", "color", "sides", "borderless", "number_up")})
     jid = app.JOBS.create(ctx.printer_name, attrs["job-name"], "web-ui")
