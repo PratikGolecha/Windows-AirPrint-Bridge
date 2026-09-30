@@ -40,6 +40,7 @@ class FeederEmpty(RuntimeError):
     pass
 
 
+_ADF_LOCK = threading.Lock()
 SCAN_LOCK = threading.Lock()   # one physical scan at a time
 
 
@@ -86,7 +87,8 @@ def parse_scan_settings(xml_bytes: bytes) -> Dict[str, object]:
 class EsclScanner:
     """eSCL front-end for one WIA scanner."""
 
-    def __init__(self, wia_name: str, display_name: str, uuid_str: str, adf=None) -> None:
+    def __init__(self, wia_name: str, display_name: str, uuid_str: str, adf=None, quality: int = 85) -> None:
+        self.quality = max(30, min(int(quality or 85), 100))          # JPEG quality of scans ("scan_quality" in config)
         self.wia_name = wia_name
         self._adf = adf                  # True/False from config "adf", None = ask the scanner driver
         self.display_name = display_name
@@ -97,7 +99,8 @@ class EsclScanner:
     def has_adf(self) -> bool:
         """Does this scanner have an automatic document feeder?  config "adf" wins; otherwise ask WIA once
         (Document Handling Capabilities bit 1 = feeder) and remember the answer."""
-        if self._adf is None:
+        with _ADF_LOCK:                    # two clients asking at once made WIA answer "device busy"
+          if self._adf is None:
             try:
                 import pythoncom
                 import win32com.client
@@ -295,7 +298,7 @@ class EsclScanner:
             return self.jobs.pop(job_id, None) is not None
 
     @staticmethod
-    def _as_jpeg(data: bytes, color: bool, dpi: int, region=None) -> bytes:
+    def _as_jpeg(data: bytes, color: bool, dpi: int, region=None, quality: int = 85) -> bytes:
         """WIA drivers often ignore the requested format and return a BMP/PNG, and
         some mishandle crop settings.  So: scan the whole glass, crop the requested
         region here (region is x, y, w, h in 1/300 inch) and always return a real JPEG."""
@@ -325,7 +328,7 @@ class EsclScanner:
             return data                                   # already a proper JPEG, untouched
         img = img.convert("RGB" if color else "L")
         buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=85, dpi=(dpi, dpi))
+        img.save(buf, "JPEG", quality=quality, dpi=(dpi, dpi))
         return buf.getvalue()
 
     # ------------------------------------------------------------------ #
@@ -370,7 +373,7 @@ class EsclScanner:
                 image.SaveFile(path)
                 with open(path, "rb") as fh:
                     data = fh.read()
-                return self._as_jpeg(data, bool(settings["color"]), dpi, settings.get("region"))
+                return self._as_jpeg(data, bool(settings["color"]), dpi, settings.get("region"), self.quality)
             finally:
                 if os.path.exists(path):
                     os.remove(path)
@@ -430,7 +433,7 @@ class EsclScanner:
                 finally:
                     if os.path.exists(path):
                         os.remove(path)
-                add_page(self._as_jpeg(data, bool(settings["color"]), dpi, settings.get("region")))
+                add_page(self._as_jpeg(data, bool(settings["color"]), dpi, settings.get("region"), self.quality))
                 count += 1
                 logger.info("feeder: sheet %d scanned", count)
             if count == 0:

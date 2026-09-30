@@ -163,3 +163,10 @@ Details and pitfalls: notes-folder GOTCHAS #45.
 `"ip": "192.168.0.23"` in a printer's config entry makes the bridge announce that printer at that address (Bonjour A record
 `<display-name>.local`, IPP/eSCL URLs, WSD address) instead of the PC's. The address must already exist on the PC's wired card
 (Windows: static config, primary + secondary with `SkipAsSource`) - otherwise the bridge logs an error and falls back to the PC's address.
+
+## Per-printer config keys (all optional)
+
+`printer` (Windows queue name), `display_name`, `scanner` (WIA name), `default_paper`, `ip` (own address), `color` (true/false, else detected),
+`location`, `model`, `ppm`, `media` (list of IPP names, else the printer's own forms), `adf` (true/false, else detected), `scan_quality` (JPEG, default 85),
+`wsd`, `wsd_model`, `wsd_maker`, `wsd_uuid`, `wsd_url`, `wsd_firmware`.  Top level: `port` (IPP/eSCL port, default 631), `wsd_port`, and the `printers` list.
+Files that must be deployed together: `airprint_bridge.py`, `escl_scanner.py`, `wsd_device.py`, `job_tracking.py`.

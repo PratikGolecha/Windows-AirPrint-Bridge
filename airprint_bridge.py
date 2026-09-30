@@ -42,6 +42,21 @@ try:                                  # optional scanner (eSCL/AirScan) support
     import escl_scanner
 except ImportError:                   # pragma: no cover
     escl_scanner = None
+# Load the printing libraries ONCE, here in the main thread.  Importing them for the first time from a background
+# print thread stalled forever (win32ui's DLL load), which left jobs stuck in "processing".
+try:
+    import pythoncom
+    import win32con
+    import win32ui
+    import fitz
+    from PIL import Image, ImageWin
+except ImportError:                    # spool_to_printer reports a clear error if one is really missing
+    pass
+
+import job_tracking
+
+JOBS = job_tracking.JobTracker()       # IPP job ids/states (see job_tracking.py)
+
 try:
     import wsd_device
 except ImportError:      # optional
@@ -484,6 +499,10 @@ def spool_to_printer(
     printer_name: str,
     media_size_mm: Optional[Tuple[float, float]] = None,
     color_mode: str = "",
+    copies: int = 1,
+    quality: str = "",
+    media_type: str = "",
+    doc_name: str = "",
 ) -> None:
     """
     Send *file_path* to the Windows print queue of *printer_name*.
@@ -624,15 +643,26 @@ def spool_to_printer(
                     devmode = None
 
             # Colour / monochrome as chosen by the sender (print-color-mode); "auto" or nothing = the driver default
-            if color_mode in ("color", "monochrome"):
+            quality_dm = {"3": -1, "5": -4}.get(str(quality))            # IPP draft -> DMRES_DRAFT, high -> DMRES_HIGH
+            media_dm = 3 if "photo" in media_type or "glossy" in media_type else (1 if media_type in ("stationery", "plain") else 0)
+            if color_mode in ("color", "monochrome") or quality_dm or media_dm:
                 try:
                     if devmode is None:
                         devmode = win32print.GetPrinter(hprinter, 2)["pDevMode"]
-                    devmode.Color = win32con.DMCOLOR_MONOCHROME if color_mode == "monochrome" else win32con.DMCOLOR_COLOR
-                    devmode.Fields |= win32con.DM_COLOR
-                    logger.info("Print colour mode set to %s", color_mode)
+                    if color_mode in ("color", "monochrome"):
+                        devmode.Color = win32con.DMCOLOR_MONOCHROME if color_mode == "monochrome" else win32con.DMCOLOR_COLOR
+                        devmode.Fields |= win32con.DM_COLOR
+                        logger.info("Print colour mode set to %s", color_mode)
+                    if quality_dm:
+                        devmode.PrintQuality = quality_dm
+                        devmode.Fields |= 0x400                       # DM_PRINTQUALITY
+                        logger.info("Print quality set to %s", "draft" if quality_dm == -1 else "high")
+                    if media_dm:
+                        devmode.MediaType = media_dm
+                        devmode.Fields |= 0x2000000                   # DM_MEDIATYPE
+                        logger.info("Media type set to %s", media_type)
                 except Exception:  # noqa: BLE001
-                    logger.exception("could not set the colour mode - using the driver default")
+                    logger.exception("could not set colour/quality/media-type - using the driver defaults")
 
             # ----------------------------------------------------------
             # Create the printer DC (using win32gui.CreateDC with devmode)
@@ -657,70 +687,74 @@ def spool_to_printer(
             printer_dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
             logger.info("Printer DPI: %d × %d", printer_dpi_x, printer_dpi_y)
 
-            hdc.StartDoc(file_path)
+            hdc.StartDoc(doc_name or file_path)
 
             pdf_doc = fitz.open(file_path)
-            for page_num in range(len(pdf_doc)):
-                logger.info("Rendering page %d/%d...", page_num + 1, len(pdf_doc))
-                hdc.StartPage()
+            n_copies = max(1, min(int(copies or 1), 99))
+            if n_copies > 1:
+                logger.info("Printing %d copies", n_copies)
+            for _copy in range(n_copies):
+                for page_num in range(len(pdf_doc)):
+                    logger.info("Rendering page %d/%d...", page_num + 1, len(pdf_doc))
+                    hdc.StartPage()
 
-                page = pdf_doc.load_page(page_num)
+                    page = pdf_doc.load_page(page_num)
 
-                printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
-                printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
-                logger.info(
-                    "DC imageable area: %d × %d px  (page PDF rect: %.1f × %.1f pts)",
-                    printable_width, printable_height,
-                    page.rect.width, page.rect.height,
-                )
-
-                # --------------------------------------------------
-                # DPI-based scaling: render at native printer DPI
-                # (1 PDF pt = DPI/72 pixels).
-                # --------------------------------------------------
-                dpi_scale_x = printer_dpi_x / 72.0
-                dpi_scale_y = printer_dpi_y / 72.0
-
-                rendered_w = page.rect.width * dpi_scale_x
-                rendered_h = page.rect.height * dpi_scale_y
-
-                scale_w = printable_width / rendered_w if rendered_w > 0 else 1.0
-                scale_h = printable_height / rendered_h if rendered_h > 0 else 1.0
-
-                # If width matches printable area (within 5%) but height is much smaller
-                # (typical for thermal label printers where the driver form height is smaller
-                # than the actual label stock), DO NOT shrink width to fit height!
-                if scale_w >= 0.95 and scale_h < 0.7:
-                    logger.warning(
-                        "Printer DC height (%d px) is significantly smaller than document height (%d px), "
-                        "but width matches (%.1f%%). Preserving 1:1 scale to avoid shrunken label.",
-                        printable_height, int(rendered_h), scale_w * 100.0,
+                    printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
+                    printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
+                    logger.info(
+                        "DC imageable area: %d × %d px  (page PDF rect: %.1f × %.1f pts)",
+                        printable_width, printable_height,
+                        page.rect.width, page.rect.height,
                     )
-                    fit_scale = min(1.0, scale_w)
-                elif rendered_w > printable_width or rendered_h > printable_height:
-                    fit_scale = min(scale_w, scale_h)
-                    logger.info("Page exceeds printable area — shrink-to-fit scale=%.4f", fit_scale)
-                else:
-                    fit_scale = 1.0
 
-                final_scale_x = dpi_scale_x * fit_scale
-                final_scale_y = dpi_scale_y * fit_scale
+                    # --------------------------------------------------
+                    # DPI-based scaling: render at native printer DPI
+                    # (1 PDF pt = DPI/72 pixels).
+                    # --------------------------------------------------
+                    dpi_scale_x = printer_dpi_x / 72.0
+                    dpi_scale_y = printer_dpi_y / 72.0
 
-                matrix = fitz.Matrix(final_scale_x, final_scale_y)
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                    rendered_w = page.rect.width * dpi_scale_x
+                    rendered_h = page.rect.height * dpi_scale_y
 
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    scale_w = printable_width / rendered_w if rendered_w > 0 else 1.0
+                    scale_h = printable_height / rendered_h if rendered_h > 0 else 1.0
 
-                x_offset = max(0, (printable_width - pix.width) // 2)
-                y_offset = max(0, (printable_height - pix.height) // 2)
+                    # If width matches printable area (within 5%) but height is much smaller
+                    # (typical for thermal label printers where the driver form height is smaller
+                    # than the actual label stock), DO NOT shrink width to fit height!
+                    if scale_w >= 0.95 and scale_h < 0.7:
+                        logger.warning(
+                            "Printer DC height (%d px) is significantly smaller than document height (%d px), "
+                            "but width matches (%.1f%%). Preserving 1:1 scale to avoid shrunken label.",
+                            printable_height, int(rendered_h), scale_w * 100.0,
+                        )
+                        fit_scale = min(1.0, scale_w)
+                    elif rendered_w > printable_width or rendered_h > printable_height:
+                        fit_scale = min(scale_w, scale_h)
+                        logger.info("Page exceeds printable area — shrink-to-fit scale=%.4f", fit_scale)
+                    else:
+                        fit_scale = 1.0
 
-                dib = ImageWin.Dib(img)
-                dib.draw(
-                    hdc.GetHandleOutput(),
-                    (x_offset, y_offset, x_offset + pix.width, y_offset + pix.height)
-                )
+                    final_scale_x = dpi_scale_x * fit_scale
+                    final_scale_y = dpi_scale_y * fit_scale
 
-                hdc.EndPage()
+                    matrix = fitz.Matrix(final_scale_x, final_scale_y)
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+                    x_offset = max(0, (printable_width - pix.width) // 2)
+                    y_offset = max(0, (printable_height - pix.height) // 2)
+
+                    dib = ImageWin.Dib(img)
+                    dib.draw(
+                        hdc.GetHandleOutput(),
+                        (x_offset, y_offset, x_offset + pix.width, y_offset + pix.height)
+                    )
+
+                    hdc.EndPage()
 
             pdf_doc.close()
             hdc.EndDoc()
@@ -1035,7 +1069,7 @@ def extract_ipp_job_attributes(raw: bytes) -> dict[str, str]:
                     attrs["media"] = val
                 else:
                     attrs[effective_name] = val
-            elif tag == IPP_TAG_INTEGER and value_len == 4:
+            elif tag in (IPP_TAG_INTEGER, IPP_TAG_ENUM) and value_len == 4:
                 val_int = struct.unpack("!i", attr_value_raw)[0]
                 attrs[effective_name] = str(val_int)
 
@@ -1056,6 +1090,52 @@ def extract_ipp_job_attributes(raw: bytes) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Build rich Get-Printer-Attributes response
 # ---------------------------------------------------------------------------
+
+_media_cache: dict = {}
+_FALLBACK_MEDIA = ["iso_a4_210x297mm", "na_letter_8.5x11in", "iso_a5_148x210mm", "iso_a6_105x148mm", "iso_a7_74x105mm",
+                   "iso_a8_52x74mm", "na_legal_8.5x14in", "na_index-4x6_4x6in", "om_small-photo_100x150mm"]
+
+
+def supported_media(printer_name: str, cfg: Optional[dict], default_media: str) -> list:
+    """Paper sizes to advertise: config "media": [...] if given, else the printer's own Windows forms
+    (mapped to IPP names, unknown ones as custom_<name>_<w>x<h>mm), else a generic list.  Cached 5 minutes."""
+    if cfg and isinstance(cfg.get("media"), list) and cfg["media"]:
+        found = [str(m) for m in cfg["media"]]
+    else:
+        hit = _media_cache.get(printer_name)
+        if hit and time.time() - hit[0] < 300:
+            found = list(hit[1])
+        else:
+            found = []
+            try:
+                papers = win32print.DeviceCapabilities(printer_name, "", 2)      # DC_PAPERS
+                sizes = win32print.DeviceCapabilities(printer_name, "", 3)       # DC_PAPERSIZE (0.1 mm)
+                names = win32print.DeviceCapabilities(printer_name, "", 16)      # DC_PAPERNAMES
+                known, custom = [], []
+                for sz, nm in zip(sizes, names):
+                    w, h = sorted((sz["x"] / 10.0, sz["y"] / 10.0))
+                    if w < 20 or h > 1000:
+                        continue
+                    kw = next((k for k, (mw, mh) in IPP_MEDIA_SIZES.items()
+                               if abs(min(mw, mh) - w) < 1.5 and abs(max(mw, mh) - h) < 1.5), None)
+                    if kw:
+                        if kw not in known:
+                            known.append(kw)
+                    else:
+                        ck = f"custom_{_slug(str(nm).strip())[:30]}_{w:g}x{h:g}mm"
+                        IPP_MEDIA_SIZES[ck] = (w, h)
+                        if ck not in custom:
+                            custom.append(ck)
+                found = (known + custom)[:24]
+            except Exception:  # noqa: BLE001
+                logger.debug("could not read the printer's paper forms", exc_info=True)
+            if found:
+                _media_cache[printer_name] = (time.time(), tuple(found))
+    if not found:
+        found = list(_FALLBACK_MEDIA)
+    out = [default_media] + [m for m in found if m != default_media]
+    return out
+
 
 def _build_printer_attributes(
     printer_name: str,
@@ -1078,8 +1158,8 @@ def _build_printer_attributes(
     attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "uri-authentication-supported", "none")
     attrs += _encode_text_attribute(IPP_TAG_NAME, "printer-name", printer_name)
     attrs += _encode_text_attribute(IPP_TAG_TEXT, "printer-info", display_name)
-    attrs += _encode_text_attribute(IPP_TAG_TEXT, "printer-location", f"PC: {hostname}")
-    attrs += _encode_text_attribute(IPP_TAG_TEXT, "printer-make-and-model", display_name)
+    attrs += _encode_text_attribute(IPP_TAG_TEXT, "printer-location", str((cfg or {}).get("location") or f"PC: {hostname}"))
+    attrs += _encode_text_attribute(IPP_TAG_TEXT, "printer-make-and-model", str((cfg or {}).get("model") or display_name))
 
     # --- AirPrint feature declaration (CRITICAL for iOS) ---
     # iOS uses this attribute to confirm AirPrint capability.
@@ -1090,8 +1170,11 @@ def _build_printer_attributes(
 
     # --- State ---
     # 3 = idle, 4 = processing, 5 = stopped
-    attrs += _encode_enum_attribute("printer-state", 3)
-    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "printer-state-reasons", "none")
+    pstat = job_tracking.printer_status(printer_name)
+    attrs += _encode_enum_attribute("printer-state", pstat["state"])
+    attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "printer-state-reasons", pstat["reasons"][0])
+    for extra in pstat["reasons"][1:]:
+        attrs += _encode_additional_value(IPP_TAG_KEYWORD, extra.encode("ascii"))
 
     # --- Capabilities ---
     # iOS AirPrint and Android IPP Everywhere / Mopria supported formats list.
@@ -1128,7 +1211,7 @@ def _build_printer_attributes(
         attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "print-color-mode-supported", "monochrome")
 
     # Pages-per-minute (informational)
-    attrs += _encode_integer_attribute("pages-per-minute", 10)
+    attrs += _encode_integer_attribute("pages-per-minute", int((cfg or {}).get("ppm") or 10))
 
     # Detect the printer's actual active paper form in Windows DEVMODE
     default_media = "iso_a4_210x297mm"
@@ -1165,18 +1248,8 @@ def _build_printer_attributes(
     logger.info("Active printer default media detected: %s", default_media)
 
     # Media & page size — advertise sizes with default_media first
-    all_media_sizes = [
-        default_media,
-        "iso_a4_210x297mm",
-        "na_letter_8.5x11in",
-        "iso_a5_148x210mm",
-        "iso_a6_105x148mm",
-        "iso_a7_74x105mm",
-        "iso_a8_52x74mm",
-        "na_legal_8.5x14in",
-        "na_index-4x6_4x6in",
-        "om_small-photo_100x150mm",
-    ]
+    all_media_sizes = supported_media(printer_name, cfg, default_media)
+
     # Remove duplicates while preserving order
     seen_media = set()
     unique_media = []
@@ -1226,7 +1299,7 @@ def _build_printer_attributes(
     attrs += _encode_boolean_attribute("printer-is-accepting-jobs", True)
 
     # Number of queued jobs
-    attrs += _encode_integer_attribute("queued-job-count", 0)
+    attrs += _encode_integer_attribute("queued-job-count", pstat["queued"])
 
     # PDL override
     attrs += _encode_text_attribute(
@@ -1392,11 +1465,11 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         elif op_id == IPP_OP_GET_PRINTER_ATTRIBUTES:
             self._handle_get_printer_attributes(req_id, ver_maj, ver_min)
         elif op_id == IPP_OP_GET_JOBS:
-            self._handle_get_jobs(req_id, ver_maj, ver_min)
+            self._handle_get_jobs(req_id, ver_maj, ver_min, raw)
         elif op_id == IPP_OP_GET_JOB_ATTRIBUTES:
-            self._handle_get_job_attributes(req_id, ver_maj, ver_min)
+            self._handle_get_job_attributes(req_id, ver_maj, ver_min, raw)
         elif op_id == IPP_OP_CANCEL_JOB:
-            self._handle_cancel_job(req_id, ver_maj, ver_min)
+            self._handle_cancel_job(req_id, ver_maj, ver_min, raw)
         else:
             logger.warning("Unsupported IPP operation 0x%04X", op_id)
             self._send_ipp_error(req_id, IPP_STATUS_BAD_REQUEST)
@@ -1537,61 +1610,46 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         )
 
         # Write to a temp file with unpredictable name (avoid TOCTOU race)
-        tmp_path = None
-        spool_path = None
         try:
-            tmp_fd = tempfile.NamedTemporaryFile(
-                delete=False, suffix=ext, prefix="airprint_"
-            )
+            tmp_fd = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="airprint_")
             tmp_path = tmp_fd.name
             tmp_fd.write(doc_data)
             tmp_fd.close()
             logger.info("Temp file written: %s", tmp_path)
-
-            # Convert Apple Raster (URF) to PDF — Windows can't print URF natively.
-            spool_path = tmp_path
-            if ext == ".urf":
-                spool_path = convert_urf_to_pdf(tmp_path)
-                logger.info("Spool path after conversion: %s", spool_path)
-
-            # Spool — pass the media size so the printer DC gets the right DEVMODE
-            spool_to_printer(spool_path, self.printer_name, media_size_mm=media_size_mm,
-                            color_mode=job_attrs_parsed.get("print-color-mode", ""))
-
-
         except OSError:
             logger.exception("Failed to write temp file")
             self._send_ipp_error(req_id, IPP_STATUS_INTERNAL_ERROR)
             return
-        except Exception:
-            logger.exception("Spooling failed")
-            self._send_ipp_error(req_id, IPP_STATUS_INTERNAL_ERROR)
-            return
-        finally:
-            # Clean up temp files
-            for path in (tmp_path, spool_path):
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
 
-        # Build a successful response with a job-attributes group
+        try:
+            copies = max(1, min(int(job_attrs_parsed.get("copies", "1") or 1), 99))
+        except ValueError:
+            copies = 1
+        jid = JOBS.create(self.printer_name, job_attrs_parsed.get("job-name", ""),
+                          job_attrs_parsed.get("requesting-user-name", ""))
+        # Print in the background: the phone gets its answer at once and follows the job with
+        # Get-Job-Attributes (pending -> processing -> completed / stopped / aborted / canceled).
+        threading.Thread(
+            target=_run_ipp_job, name=f"ipp-job-{jid}", daemon=True,
+            args=(jid, self.printer_name, tmp_path, ext, media_size_mm, job_attrs_parsed, copies),
+        ).start()
+
         job_attrs = struct.pack("!B", IPP_TAG_JOB)
-        job_attrs += _encode_integer_attribute("job-id", req_id)
+        job_attrs += _encode_integer_attribute("job-id", jid)
         job_attrs += _encode_text_attribute(
             IPP_TAG_URI,
             "job-uri",
-            f"ipp://{self.ctx.ip or self.host_ip}:{IPP_PORT}{self.url_prefix}/ipp/print/job/{req_id}",
+            f"ipp://{self.ctx.ip or self.host_ip}:{IPP_PORT}{self.url_prefix}/ipp/print/job/{jid}",
         )
-        job_attrs += _encode_enum_attribute("job-state", 9)  # 9 = completed
+        job_attrs += _encode_enum_attribute("job-state", job_tracking.JOB_PENDING)
+        job_attrs += _encode_text_attribute(IPP_TAG_KEYWORD, "job-state-reasons", "none")
 
         response = build_ipp_response(
             req_id, IPP_STATUS_OK, extra_groups=job_attrs,
             version_major=ver_maj, version_minor=ver_min,
         )
         self._send_raw_ipp(response)
-        logger.info("Print-Job #%d accepted and spooled successfully", req_id)
+        logger.info("Print-Job #%d accepted as job %d (%d copies) - printing in the background", req_id, jid, copies)
 
     def _handle_validate_job(
         self, req_id: int, ver_maj: int, ver_min: int,
@@ -1616,44 +1674,74 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         self._send_raw_ipp(response)
         logger.info("Get-Printer-Attributes #%d → sent attributes", req_id)
 
+    def _job_group(self, job: dict) -> bytes:
+        g = struct.pack("!B", IPP_TAG_JOB)
+        g += _encode_integer_attribute("job-id", job["id"])
+        g += _encode_text_attribute(
+            IPP_TAG_URI, "job-uri",
+            f"ipp://{self.ctx.ip or self.host_ip}:{IPP_PORT}{self.url_prefix}/ipp/print/job/{job['id']}")
+        g += _encode_enum_attribute("job-state", job["state"])
+        g += _encode_text_attribute(IPP_TAG_KEYWORD, "job-state-reasons", job["reasons"][0])
+        for extra in job["reasons"][1:]:
+            g += _encode_additional_value(IPP_TAG_KEYWORD, extra.encode("ascii"))
+        if job.get("name"):
+            g += _encode_text_attribute(IPP_TAG_NAME, "job-name", job["name"])
+        return g
+
+    @staticmethod
+    def _requested_job_id(raw: bytes) -> int:
+        a = extract_ipp_job_attributes(raw)
+        if a.get("job-id", "").lstrip("-").isdigit():
+            return int(a["job-id"])
+        tail = (a.get("job-uri", "") or "").rstrip("/").rsplit("/", 1)[-1]
+        return int(tail) if tail.isdigit() else 0
+
     def _handle_get_jobs(
-        self, req_id: int, ver_maj: int, ver_min: int,
+        self, req_id: int, ver_maj: int, ver_min: int, raw: bytes = b"",
     ) -> None:
-        """Return an empty job list (we don't queue)."""
+        """List this printer's recent jobs (which-jobs=completed -> finished ones, otherwise the active ones)."""
+        which = extract_ipp_job_attributes(raw).get("which-jobs", "not-completed") if raw else "not-completed"
+        jobs = JOBS.list(self.printer_name, completed=(which == "completed"))
+        groups = b"".join(self._job_group(j) for j in jobs)
         response = build_ipp_response(
-            req_id, IPP_STATUS_OK,
+            req_id, IPP_STATUS_OK, extra_groups=groups,
             version_major=ver_maj, version_minor=ver_min,
         )
         self._send_raw_ipp(response)
-        logger.info("Get-Jobs #%d → empty list", req_id)
+        logger.info("Get-Jobs #%d (%s) -> %d job(s)", req_id, which, len(jobs))
 
     def _handle_get_job_attributes(
-        self, req_id: int, ver_maj: int, ver_min: int,
+        self, req_id: int, ver_maj: int, ver_min: int, raw: bytes = b"",
     ) -> None:
-        """Return job-state = completed for any job ID iOS queries."""
-        job_attrs = struct.pack("!B", IPP_TAG_JOB)
-        job_attrs += _encode_integer_attribute("job-id", req_id)
-        job_attrs += _encode_enum_attribute("job-state", 9)  # completed
-        job_attrs += _encode_text_attribute(
-            IPP_TAG_KEYWORD, "job-state-reasons", "job-completed-successfully"
-        )
+        """The real state of one job; an unknown id (e.g. from before a restart) is reported completed."""
+        jid = self._requested_job_id(raw) if raw else req_id
+        job = JOBS.get(jid) or {"id": jid, "state": job_tracking.JOB_COMPLETED,
+                                "reasons": ["job-completed-successfully"], "name": ""}
         response = build_ipp_response(
-            req_id, IPP_STATUS_OK, extra_groups=job_attrs,
+            req_id, IPP_STATUS_OK, extra_groups=self._job_group(job),
             version_major=ver_maj, version_minor=ver_min,
         )
         self._send_raw_ipp(response)
-        logger.info("Get-Job-Attributes #%d → completed", req_id)
+        logger.info("Get-Job-Attributes #%d -> job %d state %d", req_id, jid, job["state"])
 
     def _handle_cancel_job(
-        self, req_id: int, ver_maj: int, ver_min: int,
+        self, req_id: int, ver_maj: int, ver_min: int, raw: bytes = b"",
     ) -> None:
-        """Acknowledge a Cancel-Job request (job already printed)."""
+        """Cancel a job: stops it and removes it from the Windows queue if it is already there."""
+        jid = self._requested_job_id(raw) if raw else 0
+        job = JOBS.get(jid)
+        if job is None or job["state"] >= job_tracking.JOB_CANCELED:
+            status = IPP_STATUS_OK if job is None else 0x0508          # not-possible for a finished job
+        else:
+            JOBS.cancel(jid)
+            job_tracking.delete_spooler_job(self.printer_name, f"AirPrint job {jid}")
+            status = IPP_STATUS_OK
         response = build_ipp_response(
-            req_id, IPP_STATUS_OK,
+            req_id, status,
             version_major=ver_maj, version_minor=ver_min,
         )
         self._send_raw_ipp(response)
-        logger.info("Cancel-Job #%d → acknowledged", req_id)
+        logger.info("Cancel-Job #%d -> job %d %s", req_id, jid, "canceled" if status == IPP_STATUS_OK else "not possible")
 
     # ------------------------------------------------------------------ #
     # Low-level response helpers                                          #
@@ -1680,6 +1768,48 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # Threaded HTTP server wrapper
 # ---------------------------------------------------------------------------
+
+def _run_ipp_job(jid: int, printer_name: str, tmp_path: str, ext: str, media_size_mm, attrs: dict, copies: int) -> None:
+    """Print one IPP job in the background and keep its state honest (runs in its own thread)."""
+    job = JOBS.get(jid)
+    spool_path = tmp_path
+    doc_name = f"AirPrint job {jid}"
+    import faulthandler
+    _hang_log = open(_app_dir / "job-hang.log", "a")       # if a job thread ever stalls, its stack is written here after 90 s
+    faulthandler.dump_traceback_later(90, repeat=False, file=_hang_log)
+    try:
+        if job and job["cancel"].is_set():
+            return
+        JOBS.set(jid, job_tracking.JOB_PROCESSING, ["job-printing"])
+        if ext == ".urf":                      # Windows can't print Apple Raster natively
+            spool_path = convert_urf_to_pdf(tmp_path)
+            logger.info("Spool path after conversion: %s", spool_path)
+        spool_to_printer(
+            spool_path, printer_name, media_size_mm=media_size_mm,
+            color_mode=attrs.get("print-color-mode", ""), copies=copies,
+            quality=attrs.get("print-quality", ""), media_type=attrs.get("media-type", ""),
+            doc_name=doc_name,
+        )
+        result = job_tracking.wait_spooler_job(JOBS, jid, printer_name, doc_name)
+        logger.info("Job %d finished: %s", jid, result)
+    except Exception:  # noqa: BLE001
+        logger.exception("Job %d failed", jid)
+        JOBS.set(jid, job_tracking.JOB_ABORTED, ["aborted-by-system"])
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        _hang_log.close()
+        try:
+            if (_app_dir / "job-hang.log").stat().st_size == 0:      # keep the file only if a stall was recorded
+                (_app_dir / "job-hang.log").unlink()
+        except OSError:
+            pass
+        for path in (tmp_path, spool_path):
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
 
 def print_document_bytes(printer_name: str, doc_data: bytes, fmt: str = "") -> None:
     """Print a document received over WSD (same pipeline as an IPP Print-Job)."""
@@ -1929,6 +2059,9 @@ def main(shutdown_event: threading.Event) -> None:
     logger.info("AirPrint Bridge starting up")
     logger.info("=" * 60)
 
+    global IPP_PORT
+    IPP_PORT = int(_load_config().get("port") or IPP_PORT)        # "port" in config.json (default 631)
+
     # ---- Detect environment ----
     host_ip = get_local_ip()
     cfgs = get_printer_configs()
@@ -1965,7 +2098,7 @@ def main(shutdown_event: threading.Event) -> None:
                 ctx.escl = escl_scanner.EsclScanner(
                     wia_name, get_display_name(printer_name, cfg),
                     str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
-                    adf=cfg.get("adf"))
+                    adf=cfg.get("adf"), quality=int(cfg.get("scan_quality") or 85))
                 logger.info("Scanner sharing enabled for WIA device: %s", wia_name)
 
         mdns = MDNSAdvertiser(printer_name, pip, IPP_PORT, scanner=ctx.escl is not None, cfg=cfg, path_prefix=prefix)
@@ -1982,7 +2115,11 @@ def main(shutdown_event: threading.Event) -> None:
                 pip, wsd_port, display, maker, model,
                 scanner=ctx.escl,
                 print_document=(lambda data, fmt, _p=printer_name: print_document_bytes(_p, data, fmt)),
-                path_prefix=prefix)
+                path_prefix=prefix,
+                status_fn=(lambda _p=printer_name: job_tracking.printer_status(_p)),
+                ppm=int(cfg.get("ppm") or 10),
+                maker_url=str(cfg.get("wsd_url") or ""),
+                firmware=str(cfg.get("wsd_firmware") or "1"))
             ctx.wsd = dev
             wsd_devs.append(dev)
 

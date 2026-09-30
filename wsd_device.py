@@ -101,7 +101,9 @@ class WsdDevice:
 
     def __init__(self, uuid_str: str, host_ip: str, port: int, display_name: str, maker: str, model: str,
                  scanner=None, print_document: Optional[Callable[[bytes, str], None]] = None,
-                 path_prefix: str = "") -> None:
+                 path_prefix: str = "", status_fn=None, ppm: int = 10, maker_url: str = "", firmware: str = "1") -> None:
+        self.status_fn, self.ppm, self.firmware = status_fn, ppm, firmware
+        self.maker_url = maker_url or f"http://www.{re.sub(r'[^a-z0-9]', '', maker.lower())}.com"
         self.uuid = uuid_str.lower()
         self.host_ip, self.port = host_ip, port
         self.display_name, self.maker, self.model = display_name, maker, model
@@ -186,7 +188,7 @@ class WsdDevice:
         body = f"""<wsx:Metadata xmlns:wsx="http://schemas.xmlsoap.org/ws/2004/09/mex">
 <wsx:MetadataSection Dialect="{NS_WSDP}/ThisModel"><wsdp:ThisModel xmlns:wsdp="{NS_WSDP}">
 <wsdp:Manufacturer xml:lang="en-US">{n(self.maker)}</wsdp:Manufacturer>
-<wsdp:ManufacturerUrl>http://www.canon.com</wsdp:ManufacturerUrl>
+<wsdp:ManufacturerUrl>{n(self.maker_url)}</wsdp:ManufacturerUrl>
 <wsdp:ModelName xml:lang="en-US">{n(self.model)}</wsdp:ModelName>
 <wsdp:ModelNumber>{n(self.model)}</wsdp:ModelNumber>
 <wsdp:PresentationUrl>http://{self.host_ip}:{self.port}/</wsdp:PresentationUrl>
@@ -195,7 +197,7 @@ class WsdDevice:
 </wsdp:ThisModel></wsx:MetadataSection>
 <wsx:MetadataSection Dialect="{NS_WSDP}/ThisDevice"><wsdp:ThisDevice xmlns:wsdp="{NS_WSDP}">
 <wsdp:FriendlyName xml:lang="en-US">{n(self.display_name)}</wsdp:FriendlyName>
-<wsdp:FirmwareVersion>1</wsdp:FirmwareVersion>
+<wsdp:FirmwareVersion>{n(self.firmware)}</wsdp:FirmwareVersion>
 <wsdp:SerialNumber>{self.uuid[-12:].upper()}</wsdp:SerialNumber>
 <df:ContainerId xmlns:df="http://schemas.microsoft.com/windows/2008/09/devicefoundation">{{{self.uuid}}}</df:ContainerId>
 </wsdp:ThisDevice></wsx:MetadataSection>
@@ -403,19 +405,20 @@ class WsdDevice:
     def _printer(self, name: str, mid: str, bel, raw: bytes, ctype: str):
         pname = escape(self.display_name)
         if name == "GetPrinterElements":
+            pstate, preason, pqueued = self._wsd_status()
             devid = escape(f"MFG:{self.maker};CMD:URF,PWGRaster;MDL:{self.model_short};CLS:PRINTER;CID:MS_PWGR;URF:SRGB24,W8,CP1,IS1,RS300,V1.4,DM1;")
             body = f"""<wprt:GetPrinterElementsResponse><wprt:PrinterElements>
 <wprt:ElementData Name="wprt:PrinterDescription" Valid="true"><wprt:PrinterDescription>
 <wprt:ColorSupported>1</wprt:ColorSupported><wprt:DeviceId>{devid}</wprt:DeviceId>
 <wprt:MultipleDocumentJobsSupported>false</wprt:MultipleDocumentJobsSupported>
-<wprt:PagesPerMinute>8</wprt:PagesPerMinute><wprt:PagesPerMinuteColor>4</wprt:PagesPerMinuteColor>
+<wprt:PagesPerMinute>{self.ppm}</wprt:PagesPerMinute><wprt:PagesPerMinuteColor>{max(1, self.ppm // 2)}</wprt:PagesPerMinuteColor>
 <wprt:PrinterName xml:lang="en-US">{pname}</wprt:PrinterName></wprt:PrinterDescription></wprt:ElementData>
 <wprt:ElementData Name="wprt:PrinterConfiguration" Valid="true"><wprt:PrinterConfiguration><wprt:PrinterEventRate>1</wprt:PrinterEventRate>
 <wprt:Finishings><wprt:CollationSupported>0</wprt:CollationSupported><wprt:JogOffsetSupported>0</wprt:JogOffsetSupported>
 <wprt:DuplexerInstalled>0</wprt:DuplexerInstalled><wprt:StaplerInstalled>0</wprt:StaplerInstalled><wprt:HolePunchInstalled>0</wprt:HolePunchInstalled></wprt:Finishings>
 </wprt:PrinterConfiguration></wprt:ElementData>
 <wprt:ElementData Name="wprt:PrinterStatus" Valid="true"><wprt:PrinterStatus><wprt:PrinterCurrentTime>{time.strftime('%Y-%m-%dT%H:%M:%S')}</wprt:PrinterCurrentTime>
-<wprt:PrinterState>Idle</wprt:PrinterState><wprt:PrinterPrimaryStateReason>None</wprt:PrinterPrimaryStateReason><wprt:QueuedJobCount>0</wprt:QueuedJobCount></wprt:PrinterStatus></wprt:ElementData>
+<wprt:PrinterState>{pstate}</wprt:PrinterState><wprt:PrinterPrimaryStateReason>{preason}</wprt:PrinterPrimaryStateReason><wprt:QueuedJobCount>{pqueued}</wprt:QueuedJobCount></wprt:PrinterStatus></wprt:ElementData>
 <wprt:ElementData Name="wprt:DefaultPrintTicket" Valid="true"><wprt:DefaultPrintTicket><wprt:JobDescription><wprt:JobName>DefaultName</wprt:JobName>
 <wprt:JobOriginatingUserName>DefaultUser</wprt:JobOriginatingUserName></wprt:JobDescription></wprt:DefaultPrintTicket></wprt:ElementData>
 </wprt:PrinterElements></wprt:GetPrinterElementsResponse>"""
@@ -453,6 +456,22 @@ class WsdDevice:
                                      f"<wprt:JobStatus><wprt:JobId>{jid}</wprt:JobId><wprt:JobState>Completed</wprt:JobState></wprt:JobStatus>"
                                      f"</wprt:ElementData></wprt:JobElements></wprt:GetJobElementsResponse>"))
         return None
+
+    _WSD_REASON = {"media-empty-error": "MediaEmpty", "media-jam-error": "MediaJam", "media-needed-error": "MediaNeeded",
+                   "offline-report": "Offline", "door-open-error": "DoorOpen", "marker-supply-empty-error": "MarkerSupplyEmpty",
+                   "marker-supply-low-warning": "MarkerSupplyLow", "paused": "Paused", "output-area-full-error": "OutputAreaFull"}
+
+    def _wsd_status(self):
+        """(PrinterState, PrimaryStateReason, QueuedJobCount) from the real Windows queue."""
+        try:
+            st = self.status_fn() if self.status_fn else None
+        except Exception:  # noqa: BLE001
+            st = None
+        if not st:
+            return "Idle", "None", 0
+        state = {3: "Idle", 4: "Processing", 5: "Stopped"}.get(st["state"], "Idle")
+        reason = next((self._WSD_REASON[r] for r in st["reasons"] if r in self._WSD_REASON), "None" if st["reasons"] == ["none"] else "Other")
+        return state, reason, st.get("queued", 0)
 
     @staticmethod
     def _mtom_soap(raw: bytes, ctype: str) -> bytes:
