@@ -1250,8 +1250,9 @@ def _build_printer_attributes(
 class PrinterCtx:
     """Everything that belongs to ONE shared printer (its Windows queue, config, scanner and WSD device)."""
 
-    def __init__(self, pid: str, printer_name: str, cfg: dict) -> None:
+    def __init__(self, pid: str, printer_name: str, cfg: dict, ip: str = "") -> None:
         self.id, self.printer_name, self.cfg = pid, printer_name, cfg
+        self.ip = ip                     # the address this printer is announced at ("ip" in config, else the PC's own)
         self.escl = None
         self.wsd = None
 
@@ -1429,7 +1430,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
                 self._send_plain(200, scanner.status_xml(), "text/xml")
             elif method == "POST" and parts[1:] == ["ScanJobs"]:
                 job_id = scanner.create_job(body)
-                host = self.headers.get("Host") or f"{self.host_ip}:{IPP_PORT}"
+                host = self.headers.get("Host") or f"{self.ctx.ip or self.host_ip}:{IPP_PORT}"
                 self._send_plain(201, b"", headers={
                     "Location": f"http://{host}{self.url_prefix}/eSCL/ScanJobs/{job_id}"})
             elif method == "GET" and len(parts) == 4 and parts[1] == "ScanJobs" and parts[3] == "NextDocument":
@@ -1550,7 +1551,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         job_attrs += _encode_text_attribute(
             IPP_TAG_URI,
             "job-uri",
-            f"ipp://{self.host_ip}:{IPP_PORT}{self.url_prefix}/ipp/print/job/{req_id}",
+            f"ipp://{self.ctx.ip or self.host_ip}:{IPP_PORT}{self.url_prefix}/ipp/print/job/{req_id}",
         )
         job_attrs += _encode_enum_attribute("job-state", 9)  # 9 = completed
 
@@ -1576,7 +1577,7 @@ class IPPRequestHandler(BaseHTTPRequestHandler):
         self, req_id: int, ver_maj: int, ver_min: int,
     ) -> None:
         """Return a rich set of printer attributes for discovery."""
-        attrs = _build_printer_attributes(self.printer_name, self.host_ip, self.ctx.cfg, self.url_prefix)
+        attrs = _build_printer_attributes(self.printer_name, self.ctx.ip or self.host_ip, self.ctx.cfg, self.url_prefix)
         response = build_ipp_response(
             req_id, IPP_STATUS_OK, extra_groups=attrs,
             version_major=ver_maj, version_minor=ver_min,
@@ -1756,6 +1757,8 @@ class MDNSAdvertiser:
             .replace("\\", "-")
             .replace(".", "-")[:60]
         )
+        if self._cfg and self._cfg.get("ip"):
+            safe_host = _slug(display_name)[:60]            # e.g. canon-printer-cabin-2.local -> the printer's own address
 
         # Unique UUID per printer + machine so multiple PCs don't collide on AirPrint clients
         printer_uuid_str = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{self._printer_name}@{hostname}"))
@@ -1908,8 +1911,17 @@ def main(shutdown_event: threading.Event) -> None:
     wsd_devs = []
     for n, cfg in enumerate(cfgs):
         printer_name = cfg["printer"]
-        ctx = PrinterCtx(cfg["id"], printer_name, cfg)
+        pip = str(cfg.get("ip") or host_ip)              # the printer's own address (config "ip") or the PC's
+        if pip != host_ip:
+            try:                                         # is that address really on this PC right now?
+                _t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); _t.bind((pip, 0)); _t.close()
+            except OSError:
+                logger.error("configured ip %s is not assigned to this PC - announcing at %s instead", pip, host_ip)
+                pip = host_ip
+        ctx = PrinterCtx(cfg["id"], printer_name, cfg, pip)
         contexts[ctx.id] = ctx
+        if pip != host_ip:
+            logger.info("Printer %s is announced at its own address %s (PC address %s)", printer_name, pip, host_ip)
         first = (n == 0)
         prefix = "" if first else "/" + ctx.id           # the first printer keeps the old URLs in its announcements
         logger.info("Printer %d: %s  (id=%s)", n + 1, printer_name, ctx.id)
@@ -1925,7 +1937,7 @@ def main(shutdown_event: threading.Event) -> None:
                     adf=cfg.get("adf"))
                 logger.info("Scanner sharing enabled for WIA device: %s", wia_name)
 
-        mdns = MDNSAdvertiser(printer_name, host_ip, IPP_PORT, scanner=ctx.escl is not None, cfg=cfg, path_prefix=prefix)
+        mdns = MDNSAdvertiser(printer_name, pip, IPP_PORT, scanner=ctx.escl is not None, cfg=cfg, path_prefix=prefix)
         mdns.register()
         mdns_list.append(mdns)
 
@@ -1936,7 +1948,7 @@ def main(shutdown_event: threading.Event) -> None:
             wsd_port = int(cfg.get("wsd_port") or IPP_PORT)
             dev = wsd_device.WsdDevice(
                 str(cfg.get("wsd_uuid") or uuid.uuid5(uuid.NAMESPACE_DNS, f"{printer_name}@{socket.gethostname()}")),
-                host_ip, wsd_port, display, maker, model,
+                pip, wsd_port, display, maker, model,
                 scanner=ctx.escl,
                 print_document=(lambda data, fmt, _p=printer_name: print_document_bytes(_p, data, fmt)),
                 path_prefix=prefix)
